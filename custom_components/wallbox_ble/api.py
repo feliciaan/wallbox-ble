@@ -72,6 +72,22 @@ class WallboxBLEApiConst:
             "mode": "75a9f022-af03-4e41-b4bc-9de90a47d50b",
             "stream_mode": None,
         },
+        {
+            # Pulsar Max ("u-blox" radio). Single characteristic used for BOTH
+            # writes and notifications (rx == tx), no mode/stream characteristic.
+            # UUIDs from the botts7/esp32-wallbox reference gateway, verified
+            # against a real Max on fw 6.11.16. NOTE: only OLD firmware works
+            # unauthenticated like this. Max fw >= 6.11.26 migrates to the
+            # bgexpress dual-char profile AND requires an encrypted BLE link
+            # (SMP pairing, charger PIN as passkey) before notifications are
+            # accepted; that is NOT yet implemented here.
+            "name": "pulsar_max",
+            "service": "2456e1b9-26e2-8f83-e744-f34f01e9d701",
+            "rx": "2456e1b9-26e2-8f83-e744-f34f01e9d703",
+            "tx": "2456e1b9-26e2-8f83-e744-f34f01e9d703",
+            "mode": None,
+            "stream_mode": None,
+        },
     ]
 
     GET_AUTOLOCK = "g_alo"

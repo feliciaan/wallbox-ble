@@ -11,7 +11,8 @@
     { "local_name": "WB6*", "service_uuid": "331a36f5-2459-45ea-9d95-6142f0c4b307" },
     { "local_name": "WB7*", "service_uuid": "331a36f5-2459-45ea-9d95-6142f0c4b307" },
     { "local_name": "WB8*", "service_uuid": "331a36f5-2459-45ea-9d95-6142f0c4b307" },
-    { "local_name": "WB9*", "service_uuid": "331a36f5-2459-45ea-9d95-6142f0c4b307" }
+    { "local_name": "WB9*", "service_uuid": "331a36f5-2459-45ea-9d95-6142f0c4b307" },
+    { "service_uuid": "2456e1b9-26e2-8f83-e744-f34f01e9d701" }
   ],
   "codeowners": [
     "@jagheterfredrik",
@@ -22,5 +23,5 @@
   "documentation": "https://github.com/daniel-meyer-pl/wallbox-ble",
   "iot_class": "local_polling",
   "issue_tracker": "https://github.com/daniel-meyer-pl/wallbox-ble/issues",
-  "version": "0.3.0"
+  "version": "0.4.0"
 }
