@@ -21,6 +21,26 @@ from .const import LOGGER
 HEALTH_CHECK_INTERVAL = 15
 STALE_RECONNECT_S = 60
 
+# Per-write BLE timeout. A BlueZ/dbus write_gatt_char can wedge in an
+# UNCANCELLABLE state: the ATT write already reached the charger (the command
+# takes effect) but the dbus reply is lost, so the coroutine never returns.
+# asyncio.wait_for() does NOT save us here — on timeout it cancels the write and
+# then AWAITS the cancellation, which for a dbus-wedged call never lands, so
+# wait_for() itself hangs forever. That pinned an HA service call / automation
+# task at current=1 for ~10 h (see write-up 2026-08-01). We therefore race the
+# write against this timeout and ABANDON the orphaned task WITHOUT awaiting it,
+# so control always returns to the caller after WRITE_TIMEOUT_S.
+WRITE_TIMEOUT_S = 2
+
+
+def _drain_abandoned(task):
+    """Retrieve a finished (abandoned) write task's result/exception so asyncio
+    does not log 'Task exception was never retrieved'. The task may complete much
+    later, when the wedged dbus call finally unblocks or the link is dropped."""
+    if not task.cancelled():
+        with contextlib.suppress(Exception):
+            task.exception()
+
 
 class WallboxBLEApiConst:
     # Default (Pulsar Plus / "BgExpress" radio). Overridden at runtime once we
@@ -193,7 +213,7 @@ class WallboxBLEApiClient:
         async def callback_handler(sender, data):
             await self.rx_queue.put(data)
 
-        disconnected_event = asyncio.Event()
+        disconnected_event = self._disconnected_event
 
         def disconnected_callback(client):
             LOGGER.debug("Disconnected!")
@@ -201,6 +221,10 @@ class WallboxBLEApiClient:
 
         while True:
             LOGGER.debug("Connecting...")
+            # Reset any pending reconnect signal (from a prior disconnect or an
+            # abandoned write) BEFORE we connect, so the fresh link is not torn
+            # down immediately.
+            disconnected_event.clear()
 
             try:
                 device = async_ble_device_from_address(self.hass, self.address, connectable=True)
@@ -229,12 +253,12 @@ class WallboxBLEApiClient:
                 # 1) enable notifications first
                 await self.client.start_notify(self.tx_uuid, callback_handler)
                 # 2) then switch the (Zentri) radio into raw STREAM mode
+                # (abandon-safe: a wedged setup write must not pin the client task)
                 if self.stream_mode is not None and self.mode_uuid:
-                    try:
-                        await self.client.write_gatt_char(self.mode_uuid, bytes([self.stream_mode]), True)
+                    if await self._write_abandonable(self.mode_uuid, bytes([self.stream_mode])):
                         LOGGER.debug(f"Set stream mode {self.stream_mode} on {self.mode_uuid}")
-                    except Exception as e:
-                        LOGGER.debug(f"Failed to set stream mode: {e}")
+                    else:
+                        LOGGER.debug("Failed/timed out setting stream mode")
                 # 3) authenticate the session (charger expects "suser" with its
                 # own user id, which we read back from r_dat) so that control
                 # commands (lock, charge current, ...) are accepted.
@@ -266,7 +290,9 @@ class WallboxBLEApiClient:
                         await self.client.disconnect()
 
             self.client = None
-            disconnected_event.clear()
+            # NOTE: do not clear disconnected_event here — a reconnect signal may
+            # have arrived during the disconnect above; it is cleared at the top
+            # of the loop just before the next connect.
 
     async def connection_established(self):
         while True:
@@ -289,6 +315,10 @@ class WallboxBLEApiClient:
         self.hass = hass
         self.address = address
         self.last_success = 0.0
+        # Shared reconnect signal: set by the disconnected_callback AND by
+        # request() when a write is abandoned, so run_ble_client rebuilds the
+        # link (which also clears any orphaned dbus write).
+        self._disconnected_event = asyncio.Event()
         self.client_task = asyncio.create_task(self.run_ble_client())
         return self
 
@@ -312,6 +342,30 @@ class WallboxBLEApiClient:
     @property
     def ready(self):
         return self.client and self.client.is_connected
+
+    async def _write_abandonable(self, char, payload) -> bool:
+        """Write one BLE chunk, returning True only on confirmed completion.
+
+        On timeout the underlying write_gatt_char is ABANDONED, not awaited:
+        asyncio.wait() lets us regain control after WRITE_TIMEOUT_S while the
+        (possibly dbus-wedged, uncancellable) write task is left to finish or
+        die on its own. This is the whole point — `await asyncio.wait_for(write)`
+        would block forever waiting for a cancellation that a wedged dbus call
+        never delivers. Returns False on timeout or write error.
+        """
+        task = asyncio.ensure_future(self.client.write_gatt_char(char, payload, True))
+        done, _pending = await asyncio.wait({task}, timeout=WRITE_TIMEOUT_S)
+        if task not in done:
+            # Wedged: best-effort cancel (harmless if ignored) but DO NOT await
+            # it. Drain later so no "exception never retrieved" is logged.
+            task.cancel()
+            task.add_done_callback(_drain_abandoned)
+            return False
+        exc = task.exception()
+        if exc is not None:
+            LOGGER.error(f"Failed to write to Bluetooth {exc=}")
+            return False
+        return True
 
     async def request(self, method, parameter=None):
         if not self.ready:
@@ -337,20 +391,21 @@ class WallboxBLEApiClient:
         data = data + bytes([sum(c for c in data) % 256])
 
         self.clear_rx_queue()
-        try:
-            # The charger's command characteristic is a raw UART stream that
-            # only accepts small ATT writes; a single large write is rejected
-            # with Write Not Permitted. The official app always splits the frame
-            # into 20-byte chunks (it keeps the default 23-byte ATT MTU), so we
-            # do the same regardless of the negotiated MTU.
-            chunk = 20
-            for i in range(0, len(data), chunk):
-                await asyncio.wait_for(
-                    self.client.write_gatt_char(rx_char, data[i:i + chunk], True), 2
-                )
-        except Exception as e:
-            LOGGER.error(f"Failed to write to Bluetooth {e=}")
-            return False, None
+        # The charger's command characteristic is a raw UART stream that only
+        # accepts small ATT writes; a single large write is rejected with Write
+        # Not Permitted. The official app always splits the frame into 20-byte
+        # chunks (it keeps the default 23-byte ATT MTU), so we do the same
+        # regardless of the negotiated MTU.
+        chunk = 20
+        for i in range(0, len(data), chunk):
+            if not await self._write_abandonable(rx_char, data[i:i + chunk]):
+                # Write timed out / failed. Abandon this request AND signal a
+                # reconnect so the link (and any orphaned dbus write) is rebuilt.
+                # Returning here — instead of hanging — is the fix for the
+                # controller task that was pinned at current=1 for hours.
+                LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
+                self._disconnected_event.set()
+                return False, None
 
         try:
             response = await asyncio.wait_for(self.get_parsed_response(request_id), 2)
