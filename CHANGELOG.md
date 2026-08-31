@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredrik/wallbox-ble).
 
+## [0.5.0] - 2026-08-31
+
+### Added
+
+- **BLE passkey (PIN) pairing.** Chargers on firmware >= 6.11 — every Pulsar Max
+  and Pulsar Pro built after 2025-08-01 — refuse the notification CCCD write until
+  the BLE link is encrypted, authenticating it with the fixed 6-digit "Bluetooth
+  Passcode" shown in the Wallbox app. The config flow now asks for that passcode
+  (optional; leave blank on older firmware), and `pairing.py` performs SMP pairing
+  with it before connecting, retrying once after a rejected `start_notify`.
+- Reconfigure and reauth flows for the passcode. A passcode the charger rejects
+  raises `ConfigEntryAuthFailed`, so Home Assistant asks for a new one instead of
+  reconnecting forever; changing it drops the stale BlueZ bond first, since BlueZ
+  answers `Pair()` for an already-bonded device from its saved keys without
+  re-running SMP. Removing the config entry removes the bond too.
+- Pulsar Max row in the README's BLE profile table.
+
+### Notes
+
+- `BleakClient.pair()` cannot carry a passkey: bleak's BlueZ backend just calls
+  `org.bluez.Device1.Pair()`, and BlueZ resolves the pairing agent with
+  `agent_get(sender)` — the agent registered by the *D-Bus caller* — falling back
+  to `NOINPUTNOOUTPUT` (Just Works) when that caller has none. The integration
+  therefore opens its own system-bus connection, exports an `org.bluez.Agent1`
+  with the `KeyboardOnly` capability on it, and calls `Pair()` from that same
+  connection so BlueZ routes `RequestPasskey` back to us. This mirrors the
+  `botts7/esp32-wallbox` reference gateway's NimBLE `BLE_HS_IO_KEYBOARD_ONLY` +
+  `onPassKeyRequest()`.
+- Passcode pairing requires a Bluetooth adapter on the Home Assistant host.
+  ESPHome Bluetooth proxies cannot enter a passkey: `esp32_ble_client` handles
+  only `ESP_GAP_BLE_SEC_REQ_EVT` and `ESP_GAP_BLE_AUTH_CMPL_EVT`, never
+  `ESP_GAP_BLE_PASSKEY_REQ_EVT`. Chargers without a passcode are unaffected.
+
 ## [0.4.0] - 2026-08-01
 
 ### Added
@@ -22,7 +55,7 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 - Pulsar Max on firmware ≥ 6.11.26 is **not** supported: that firmware switches
   to the Pulsar Plus dual-char profile and requires an encrypted BLE link (SMP
   pairing, charger PIN used as passkey) before notifications are accepted, which
-  is not implemented yet.
+  is not implemented yet. *(Resolved in 0.5.0.)*
 
 ## [0.3.0] - 2026-08-01
 

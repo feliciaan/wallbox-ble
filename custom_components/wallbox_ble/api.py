@@ -12,6 +12,12 @@ from bleak_retry_connector import establish_connection
 from homeassistant.components.bluetooth import async_ble_device_from_address
 
 from .const import LOGGER
+from .pairing import (
+    PairingAuthError,
+    PairingUnsupported,
+    async_adapter_for_address,
+    async_ensure_paired as async_bluez_ensure_paired,
+)
 
 # BLE link self-heal (variant A): while "connected", wake every
 # HEALTH_CHECK_INTERVAL to check liveness, and force a fresh reconnect if no
@@ -76,11 +82,10 @@ class WallboxBLEApiConst:
             # Pulsar Max ("u-blox" radio). Single characteristic used for BOTH
             # writes and notifications (rx == tx), no mode/stream characteristic.
             # UUIDs from the botts7/esp32-wallbox reference gateway, verified
-            # against a real Max on fw 6.11.16. NOTE: only OLD firmware works
-            # unauthenticated like this. Max fw >= 6.11.26 migrates to the
-            # bgexpress dual-char profile AND requires an encrypted BLE link
-            # (SMP pairing, charger PIN as passkey) before notifications are
-            # accepted; that is NOT yet implemented here.
+            # against a real Max on fw 6.11.16. Firmware >= 6.11 additionally
+            # requires an encrypted BLE link (SMP pairing with the charger's
+            # "Bluetooth Passcode" as the passkey) before the notification CCCD
+            # write is accepted -- see pairing.py and CONF_PIN.
             "name": "pulsar_max",
             "service": "2456e1b9-26e2-8f83-e744-f34f01e9d701",
             "rx": "2456e1b9-26e2-8f83-e744-f34f01e9d703",
@@ -119,6 +124,7 @@ class WallboxBLEApiConst:
     GET_POWER_BOOST_STATUS = "r_dca"
     GET_POWER_INFUSION = "g_pwi"
     GET_POWER_SHARING = "g_psh"
+    GET_PIN = "read_pin"
     GET_PROXY_MODE = "gpmod"
     GET_SCHEDULE = "r_sch"
     GET_SERIAL_NUMBER = "r_sn_"
@@ -207,6 +213,45 @@ class WallboxBLEApiClient:
                 return
         LOGGER.debug(f"No known BLE profile matched; using default UUIDs for {self.address}")
 
+    async def async_ensure_paired(self, allow_just_works=False):
+        """Bond with the charger over SMP so the encrypted link is up.
+
+        Firmware >= 6.11 rejects the notification CCCD write (and the BGX
+        stream-mode write) until the link is encrypted, which needs the
+        charger's "Bluetooth Passcode" as the SMP passkey. See pairing.py for
+        why bleak cannot do this on its own.
+
+        Returns True when the charger is bonded afterwards. Never raises: a
+        charger that does not need pairing must keep working unchanged, so a
+        failure here only downgrades to an unencrypted link and lets the
+        subsequent GATT operation decide whether that is fatal.
+        """
+        if self.pin is None and not allow_just_works:
+            return False
+
+        adapter = async_adapter_for_address(self.hass, self.address)
+        try:
+            await async_bluez_ensure_paired(self.address, self.pin, adapter)
+        except PairingUnsupported as e:
+            # Reached through an ESPHome Bluetooth proxy, or no BlueZ at all.
+            # Log once -- repeating it every reconnect buries the real error.
+            if not self._pairing_unsupported_logged:
+                self._pairing_unsupported_logged = True
+                LOGGER.warning("Cannot pair with %s: %s", self.address, e)
+            return False
+        except PairingAuthError as e:
+            # A wrong passcode never fixes itself; flag it so the coordinator
+            # can trigger a reauth flow rather than reconnect forever.
+            self.pairing_auth_failed = True
+            LOGGER.error("Bluetooth Passcode rejected by %s: %s", self.address, e)
+            return False
+        except Exception as e:
+            LOGGER.debug("Pairing with %s failed: %s", self.address, e)
+            return False
+
+        self.pairing_auth_failed = False
+        return True
+
     async def authenticate(self):
         """Replicate the app's session login.
 
@@ -246,6 +291,11 @@ class WallboxBLEApiClient:
                 device = async_ble_device_from_address(self.hass, self.address, connectable=True)
                 if not device:
                     raise Exception("No device found")
+                # Bond BEFORE connecting when a passcode is configured, so the
+                # link is encrypted from the first ATT operation. BlueZ brings
+                # the connection up itself as part of Pair(); establish_connection
+                # then reuses it. No-op once the bond is stored.
+                await self.async_ensure_paired()
                 # Use bleak_retry_connector so the connection is established
                 # reliably AND all GATT services are fully resolved before we
                 # try to use the UART characteristics (otherwise start_notify
@@ -266,8 +316,17 @@ class WallboxBLEApiClient:
                 # accepts writes once (1) notifications are enabled on the TX
                 # characteristic and (2) the module has been switched to STREAM
                 # mode. Doing these in the wrong order yields Write Not Permitted.
-                # 1) enable notifications first
-                await self.client.start_notify(self.tx_uuid, callback_handler)
+                # 1) enable notifications first. A rejected CCCD write means
+                # the charger wants an encrypted link (firmware >= 6.11), so
+                # pair and retry once -- allowing Just Works here too, since a
+                # charger without a passcode can still demand encryption.
+                try:
+                    await self.client.start_notify(self.tx_uuid, callback_handler)
+                except Exception as e:
+                    LOGGER.debug(f"start_notify failed ({e}); pairing and retrying")
+                    if not await self.async_ensure_paired(allow_just_works=True):
+                        raise
+                    await self.client.start_notify(self.tx_uuid, callback_handler)
                 # 2) then switch the (Zentri) radio into raw STREAM mode
                 # (abandon-safe: a wedged setup write must not pin the client task)
                 if self.stream_mode is not None and self.mode_uuid:
@@ -317,9 +376,16 @@ class WallboxBLEApiClient:
             asyncio.sleep(0.1)
 
     @classmethod
-    async def create(cls, hass, address):
+    async def create(cls, hass, address, pin=None):
         self = WallboxBLEApiClient()
         self.client = None
+        # Charger "Bluetooth Passcode" used as the SMP passkey, or None for
+        # firmware that pairs Just Works / does not pair at all.
+        self.pin = pin
+        # Set once BlueZ tells us the passcode was rejected, so the coordinator
+        # can raise ConfigEntryAuthFailed and send the user to the reauth form
+        # instead of retrying a PIN that will never work.
+        self.pairing_auth_failed = False
         # BLE profile UUIDs; default to the Pulsar Plus profile and refine once
         # connected via detect_profile().
         self.service_uuid = WallboxBLEApiConst.UART_SERVICE_UUID
@@ -331,6 +397,9 @@ class WallboxBLEApiClient:
         self.hass = hass
         self.address = address
         self.last_success = 0.0
+        # Log the "pairing needs a local adapter" hint once per client instead
+        # of on every reconnect attempt.
+        self._pairing_unsupported_logged = False
         # Shared reconnect signal: set by the disconnected_callback AND by
         # request() when a write is abandoned, so run_ble_client rebuilds the
         # link (which also clears any orphaned dbus write).
