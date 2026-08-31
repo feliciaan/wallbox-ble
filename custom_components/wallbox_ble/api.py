@@ -5,6 +5,7 @@ import random
 import asyncio
 import json
 import contextlib
+import re
 
 from bleak import BleakClient
 from bleak_retry_connector import establish_connection
@@ -37,6 +38,31 @@ STALE_RECONNECT_S = 60
 # write against this timeout and ABANDON the orphaned task WITHOUT awaiting it,
 # so control always returns to the caller after WRITE_TIMEOUT_S.
 WRITE_TIMEOUT_S = 2
+
+# ATT/GATT status codes meaning "this link is not paired well enough for that
+# operation". BlueZ reports the ATT error and the ESPHome proxy reports
+# esp_gatt_status_t, which uses the same values here. Note that 0x05 also covers
+# a link that IS encrypted but only with an unauthenticated ("Just Works") key,
+# which is exactly what a proxy left at the default io_capability negotiates --
+# so this fires both when nothing paired and when pairing skipped the passkey.
+AUTH_ERROR_CODES = frozenset({5, 8, 15})
+AUTH_ERROR_TEXTS = (
+    "insufficient authentication",
+    "insufficient encryption",
+    "insufficient authorization",
+    "not paired",
+)
+
+
+def _is_auth_error(exc) -> bool:
+    """True when a GATT failure means the link needs (better) pairing."""
+    if exc is None:
+        return False
+    text = str(exc).lower()
+    if any(needle in text for needle in AUTH_ERROR_TEXTS):
+        return True
+    match = re.search(r"error=(-?\d+)", text)
+    return match is not None and int(match.group(1)) in AUTH_ERROR_CODES
 
 
 def _drain_abandoned(task):
@@ -451,6 +477,10 @@ class WallboxBLEApiClient:
         self.hass = hass
         self.address = address
         self.last_success = 0.0
+        # Exception from the most recent failed BLE write, so request() can tell
+        # an authentication rejection apart from a wedged or dead link.
+        self._last_write_exc = None
+        self._auth_help_logged = False
         # Set once BlueZ turns out not to know this charger (it is served by a
         # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
         # lookup on every later reconnect.
@@ -491,8 +521,11 @@ class WallboxBLEApiClient:
         (possibly dbus-wedged, uncancellable) write task is left to finish or
         die on its own. This is the whole point — `await asyncio.wait_for(write)`
         would block forever waiting for a cancellation that a wedged dbus call
-        never delivers. Returns False on timeout or write error.
+        never delivers. Returns False on timeout or write error; the
+        exception, if any, is left in _last_write_exc so the caller can tell an
+        authentication rejection apart from a dead link.
         """
+        self._last_write_exc = None
         task = asyncio.ensure_future(self.client.write_gatt_char(char, payload, True))
         done, _pending = await asyncio.wait({task}, timeout=WRITE_TIMEOUT_S)
         if task not in done:
@@ -503,9 +536,54 @@ class WallboxBLEApiClient:
             return False
         exc = task.exception()
         if exc is not None:
-            LOGGER.error(f"Failed to write to Bluetooth {exc=}")
+            self._last_write_exc = exc
+            # Debug, not error: one rejected chunk is not itself news -- the
+            # caller reports the failure once, together with what it means.
+            LOGGER.debug(f"Failed to write to Bluetooth {exc=}")
             return False
         return True
+
+    async def _send_frame(self, rx_char, data) -> bool:
+        """Write one EaE frame to the command characteristic.
+
+        The charger's command characteristic is a raw UART stream that only
+        accepts small ATT writes; a single large write is rejected with Write
+        Not Permitted. The official app always splits the frame into 20-byte
+        chunks (it keeps the default 23-byte ATT MTU), so we do the same
+        regardless of the negotiated MTU.
+        """
+        chunk = 20
+        for i in range(0, len(data), chunk):
+            if not await self._write_abandonable(rx_char, data[i:i + chunk]):
+                return False
+        return True
+
+    def _log_auth_help(self):
+        """Explain an authentication rejection once, with the actual fix."""
+        if self._auth_help_logged:
+            return
+        self._auth_help_logged = True
+        if self.pin is None:
+            LOGGER.error(
+                "%s rejected the command because the Bluetooth link is not "
+                "authenticated, and no Bluetooth Passcode is configured. "
+                "Firmware 6.11 and newer requires one: find it in the Wallbox "
+                "app on the charger information page, then set it under "
+                "Settings > Devices & Services > Wallbox BLE > Reconfigure.",
+                self.address,
+            )
+        else:
+            LOGGER.error(
+                "%s rejected the command even though a Bluetooth Passcode is "
+                "configured. If this charger is reached through an ESPHome "
+                "Bluetooth proxy, the passcode has to be configured on the "
+                "proxy as well (esp32_ble io_capability: keyboard_only, plus a "
+                "non-connecting ble_client with an on_passkey_request "
+                "automation) -- otherwise the proxy pairs Just Works, which "
+                "leaves the link unauthenticated and the charger refuses it. "
+                "See the integration README.",
+                self.address,
+            )
 
     async def request(self, method, parameter=None):
         if not self.ready:
@@ -531,21 +609,29 @@ class WallboxBLEApiClient:
         data = data + bytes([sum(c for c in data) % 256])
 
         self.clear_rx_queue()
-        # The charger's command characteristic is a raw UART stream that only
-        # accepts small ATT writes; a single large write is rejected with Write
-        # Not Permitted. The official app always splits the frame into 20-byte
-        # chunks (it keeps the default 23-byte ATT MTU), so we do the same
-        # regardless of the negotiated MTU.
-        chunk = 20
-        for i in range(0, len(data), chunk):
-            if not await self._write_abandonable(rx_char, data[i:i + chunk]):
-                # Write timed out / failed. Abandon this request AND signal a
-                # reconnect so the link (and any orphaned dbus write) is rebuilt.
-                # Returning here — instead of hanging — is the fix for the
-                # controller task that was pinned at current=1 for hours.
-                LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
-                self._disconnected_event.set()
-                return False, None
+        ok = await self._send_frame(rx_char, data)
+
+        if not ok and _is_auth_error(self._last_write_exc):
+            # This charger accepts the notification CCCD write on an unencrypted
+            # link but refuses the command write, so a rejected WRITE -- not a
+            # failing start_notify -- is what reveals that the link needs
+            # pairing. Pair, then resend the whole frame: resuming mid-frame
+            # would leave the charger's UART parser holding half a command.
+            LOGGER.debug("Write rejected as unauthenticated; pairing and resending")
+            if await self.async_ensure_paired(allow_just_works=True):
+                self.clear_rx_queue()
+                ok = await self._send_frame(rx_char, data)
+
+        if not ok:
+            # Write timed out / failed. Abandon this request AND signal a
+            # reconnect so the link (and any orphaned dbus write) is rebuilt.
+            # Returning here — instead of hanging — is the fix for the
+            # controller task that was pinned at current=1 for hours.
+            if _is_auth_error(self._last_write_exc):
+                self._log_auth_help()
+            LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
+            self._disconnected_event.set()
+            return False, None
 
         try:
             response = await asyncio.wait_for(self.get_parsed_response(request_id), 2)

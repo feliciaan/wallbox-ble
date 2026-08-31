@@ -115,6 +115,36 @@ changes the slot count — use `connection_slots:` there.
 
 Chargers without a passcode keep working over a proxy with no extra configuration.
 
+#### Troubleshooting
+
+```
+ERROR ... Failed to write to Bluetooth exc=BleakError('Bluetooth GATT Error
+      address=54:64:DE:92:BC:7C handle=23 error=5 description=Insufficient authentication')
+WARNING ... BLE write did not complete; abandoning and forcing reconnect
+```
+
+That wording (`handle=… error=… description=…`) comes from `aioesphomeapi`, so the
+charger is being reached **through a proxy**, not a local adapter. ATT error 5 means
+the link is not *authenticated* — either nothing paired at all, or it paired "Just
+Works" without the passkey. Note that connecting and enabling notifications both
+succeed regardless; this charger only enforces authentication on the command
+characteristic, so a rejected write is the first sign. Check, in order:
+
+1. **Is a passcode stored in Home Assistant?** *Settings → Devices & Services →
+   Wallbox BLE → Reconfigure*. An entry added before this feature existed has none,
+   and without one the integration never asks the proxy to pair.
+2. **Does the proxy have the YAML above?** Without `io_capability: keyboard_only` the
+   ESP32 advertises NoInputNoOutput and can only negotiate Just Works — which
+   encrypts the link but leaves it unauthenticated, giving exactly this error.
+3. **Is the `ble_client` MAC right, and did the proxy pick up the slot change?**
+   Watch the proxy's log while Home Assistant reconnects; you should see the passkey
+   request arrive. `ESP_GATT_NO_RESOURCES` there means the connection-slot budget is
+   still overrun.
+
+If the proxy log shows a *numeric comparison* request rather than a passkey request,
+the charger chose a different pairing method — use `on_numeric_comparison_request`
+with `ble_client.numeric_comparison_reply` instead.
+
 ## Implemented features
  - charger status
  - lock / unlock

@@ -22,7 +22,21 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   reconnecting forever; changing it drops the stale BlueZ bond first, since BlueZ
   answers `Pair()` for an already-bonded device from its saved keys without
   re-running SMP. Removing the config entry removes the bond too.
-- Pulsar Max row in the README's BLE profile table.
+- Pulsar Max row in the README's BLE profile table, and a troubleshooting section
+  for the `Insufficient authentication` write error.
+
+### Fixed
+
+- An `Insufficient authentication` rejection on a command write now triggers
+  pairing and resends the frame, instead of only reconnecting in a loop. This
+  charger accepts the notification CCCD write on an unauthenticated link and
+  only enforces authentication on the command characteristic, so keying the
+  pairing retry off a failing `start_notify` never fired. ATT error 5 also
+  covers a link encrypted with an unauthenticated ("Just Works") key, which is
+  what a Bluetooth proxy left at the default `io_capability` negotiates.
+- A rejected write now logs one actionable error naming the fix — set the
+  passcode, or configure it on the proxy — rather than repeating a raw
+  `BleakError` per chunk per poll.
 
 ### Notes
 
