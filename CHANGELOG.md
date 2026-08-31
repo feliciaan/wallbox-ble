@@ -7,6 +7,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredrik/wallbox-ble).
 
+## [0.5.0] - 2026-08-31
+
+### Added
+
+- **BLE passkey (PIN) pairing.** Chargers on firmware >= 6.11 — every Pulsar Max
+  and Pulsar Pro built after 2025-08-01 — refuse the notification CCCD write until
+  the BLE link is encrypted, authenticating it with the fixed 6-digit "Bluetooth
+  Passcode" shown in the Wallbox app. The config flow now asks for that passcode
+  (optional; leave blank on older firmware), and `pairing.py` performs SMP pairing
+  with it before connecting, retrying once after a rejected `start_notify`.
+- Reconfigure and reauth flows for the passcode. A passcode the charger rejects
+  raises `ConfigEntryAuthFailed`, so Home Assistant asks for a new one instead of
+  reconnecting forever; changing it drops the stale BlueZ bond first, since BlueZ
+  answers `Pair()` for an already-bonded device from its saved keys without
+  re-running SMP. Removing the config entry removes the bond too.
+- Pulsar Max row in the README's BLE profile table.
+
+### Notes
+
+- `BleakClient.pair()` cannot carry a passkey: bleak's BlueZ backend just calls
+  `org.bluez.Device1.Pair()`, and BlueZ resolves the pairing agent with
+  `agent_get(sender)` — the agent registered by the *D-Bus caller* — falling back
+  to `NOINPUTNOOUTPUT` (Just Works) when that caller has none. The integration
+  therefore opens its own system-bus connection, exports an `org.bluez.Agent1`
+  with the `KeyboardOnly` capability on it, and calls `Pair()` from that same
+  connection so BlueZ routes `RequestPasskey` back to us. This mirrors the
+  `botts7/esp32-wallbox` reference gateway's NimBLE `BLE_HS_IO_KEYBOARD_ONLY` +
+  `onPassKeyRequest()`.
+- Through an ESPHome Bluetooth proxy the passcode has to be configured on the
+  ESP32: `bluetooth_proxy` handles only `ESP_GAP_BLE_SEC_REQ_EVT` and
+  `ESP_GAP_BLE_AUTH_CMPL_EVT`, and no API message carries a passkey. It still
+  works, because `esp32_ble` fans every GAP security event out to all registered
+  clients and `esp_ble_passkey_reply()` is keyed by BD address rather than by
+  connection — so a `ble_client` with `auto_connect: false` (which never opens a
+  connection of its own) answers `on_passkey_request` for the proxy's link. The
+  integration drives the proxy side by falling back to `BleakClient.pair()`
+  (`bluetooth_device_pair` → `esp_ble_set_encryption`) as soon as it connects,
+  rather than waiting for `start_notify` to fail — a proxy can report the CCCD
+  write as successful while the charger drops it. The proxy needs `esp32_ble`
+  (with `io_capability: keyboard_only`), `esp32_ble_tracker`, `bluetooth_proxy`
+  and `ble_client`, on ESPHome 2024.3.0 or newer; mind that the helper
+  `ble_client` consumes a connection slot, so `esp32_ble: max_connections` has to
+  be raised (or the proxy's own slot count lowered). The README carries the YAML,
+  validated with `esphome config` against 2026.9.0-dev and 2024.3.0. Chargers
+  without a passcode are unaffected.
+
 ## [0.4.0] - 2026-08-01
 
 ### Added
@@ -22,7 +68,7 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 - Pulsar Max on firmware ≥ 6.11.26 is **not** supported: that firmware switches
   to the Pulsar Plus dual-char profile and requires an encrypted BLE link (SMP
   pairing, charger PIN used as passkey) before notifications are accepted, which
-  is not implemented yet.
+  is not implemented yet. *(Resolved in 0.5.0.)*
 
 ## [0.3.0] - 2026-08-01
 

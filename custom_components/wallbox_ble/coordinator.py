@@ -48,9 +48,9 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self._reload_scheduled = False
 
     @classmethod
-    async def create(cls, hass, address):
+    async def create(cls, hass, address, pin=None):
         self = WallboxBLEDataUpdateCoordinator(hass)
-        self.wb = await WallboxBLEApiClient.create(hass, address)
+        self.wb = await WallboxBLEApiClient.create(hass, address, pin)
         return self
 
     async def async_refresh_later(self, delay):
@@ -77,6 +77,13 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
     async def _async_update_data(self):
+        if self.wb.pairing_auth_failed:
+            # The charger rejected the configured Bluetooth Passcode. Retrying
+            # cannot help, so ask the user for a new one instead of looping.
+            raise ConfigEntryAuthFailed(
+                "The charger rejected the configured Bluetooth Passcode"
+            )
+
         if not self.wb.ready:
             self._check_self_heal()
             return {}

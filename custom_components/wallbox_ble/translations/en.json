@@ -3,9 +3,14 @@
         "abort": {
             "already_configured": "Device is already configured",
             "already_in_progress": "Configuration flow is already in progress",
-            "no_devices_found": "No devices found on the network"
+            "no_devices_found": "No devices found on the network",
+            "reauth_successful": "Bluetooth Passcode updated",
+            "reconfigure_successful": "Bluetooth Passcode updated",
+            "unknown_entry": "The charger this flow belongs to no longer exists"
         },
-        "error": {},
+        "error": {
+            "invalid_pin": "The Bluetooth Passcode must be a number of up to 6 digits"
+        },
         "flow_title": "{name}",
         "step": {
             "bluetooth_confirm": {
@@ -16,6 +21,24 @@
                     "address": "Device"
                 },
                 "description": "Choose a device to setup"
+            },
+            "pin": {
+                "data": {
+                    "pin": "Bluetooth Passcode"
+                },
+                "description": "Chargers on firmware 6.11 or newer (all Pulsar Max and Pulsar Pro built after 1 August 2025) require a 6-digit Bluetooth Passcode. Find it in the Wallbox app on the charger information page. Leave this empty if your charger does not have one.\n\nIf the charger is reached through an ESPHome Bluetooth proxy rather than a local Bluetooth adapter, the passcode must also be configured on the proxy — see the integration's README."
+            },
+            "reauth_confirm": {
+                "data": {
+                    "pin": "Bluetooth Passcode"
+                },
+                "description": "{name} rejected the stored Bluetooth Passcode. Check it in the Wallbox app on the charger information page and enter it again."
+            },
+            "reconfigure": {
+                "data": {
+                    "pin": "Bluetooth Passcode"
+                },
+                "description": "Update the Bluetooth Passcode for {name}. Leave this empty if the charger does not have one."
             }
         }
     }

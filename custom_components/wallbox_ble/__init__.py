@@ -6,8 +6,9 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import WallboxBLEApiClient
-from .const import DOMAIN
+from .const import CONF_PIN, DOMAIN, LOGGER
 from .coordinator import WallboxBLEDataUpdateCoordinator
+from .pairing import async_adapter_for_address, async_unpair
 
 PLATFORMS: list[Platform] = [
     Platform.LOCK,
@@ -24,6 +25,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN][entry.entry_id] = coordinator = await WallboxBLEDataUpdateCoordinator.create(
         hass=hass,
         address=entry.unique_id,
+        pin=entry.data.get(CONF_PIN),
     )
     # https://developers.home-assistant.io/docs/integration_fetching_data#coordinated-single-api-poll-for-data-for-all-entities
     await coordinator.async_config_entry_first_refresh()
@@ -45,3 +47,19 @@ async def async_reload_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Reload config entry."""
     await async_unload_entry(hass, entry)
     await async_setup_entry(hass, entry)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop the BLE bond when the charger is removed.
+
+    Leaving a stale bond behind means a later re-add with a different passcode
+    would be answered from BlueZ's saved keys instead of re-running SMP.
+    """
+    address = entry.unique_id
+    if not address:
+        return
+    try:
+        if await async_unpair(address, async_adapter_for_address(hass, address)):
+            LOGGER.debug("Removed the BLE bond for %s", address)
+    except Exception as err:  # noqa: BLE001 - removal must never fail the flow
+        LOGGER.debug("Could not remove the BLE bond for %s: %s", address, err)
