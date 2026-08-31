@@ -340,7 +340,7 @@ class WallboxBLEApiClient:
                 # link is encrypted from the first ATT operation. BlueZ brings
                 # the connection up itself as part of Pair(); establish_connection
                 # then reuses it. No-op once the bond is stored.
-                await self.async_ensure_paired()
+                paired = await self.async_ensure_paired()
                 # Use bleak_retry_connector so the connection is established
                 # reliably AND all GATT services are fully resolved before we
                 # try to use the UART characteristics (otherwise start_notify
@@ -355,6 +355,13 @@ class WallboxBLEApiClient:
                 # Detect which BLE radio profile this charger exposes and use
                 # its UUIDs for the rest of the session.
                 self.detect_profile()
+                # A charger served by a Bluetooth proxy could not be paired
+                # above -- that path needs a live link. Do it now, proactively:
+                # waiting for start_notify to fail is not safe, because a proxy
+                # can report the CCCD write as successful while the charger
+                # quietly drops it, leaving us connected but permanently silent.
+                if self.pin is not None and not paired:
+                    await self._async_pair_over_link()
                 # IMPORTANT: replicate the exact order the official app uses, as
                 # captured from a BLE HCI snoop. The charger does NOT use BLE
                 # bonding/pairing; instead the command characteristic only

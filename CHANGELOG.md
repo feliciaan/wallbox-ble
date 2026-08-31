@@ -43,9 +43,15 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   connection — so a `ble_client` with `auto_connect: false` (which never opens a
   connection of its own) answers `on_passkey_request` for the proxy's link. The
   integration drives the proxy side by falling back to `BleakClient.pair()`
-  (`bluetooth_device_pair` → `esp_ble_set_encryption`) when the charger is not on
-  a local BlueZ adapter; requires ESPHome 2024.3.0 or newer. See the README for
-  the YAML. Chargers without a passcode are unaffected.
+  (`bluetooth_device_pair` → `esp_ble_set_encryption`) as soon as it connects,
+  rather than waiting for `start_notify` to fail — a proxy can report the CCCD
+  write as successful while the charger drops it. The proxy needs `esp32_ble`
+  (with `io_capability: keyboard_only`), `esp32_ble_tracker`, `bluetooth_proxy`
+  and `ble_client`, on ESPHome 2024.3.0 or newer; mind that the helper
+  `ble_client` consumes a connection slot, so `esp32_ble: max_connections` has to
+  be raised (or the proxy's own slot count lowered). The README carries the YAML,
+  validated with `esphome config` against 2026.9.0-dev and 2024.3.0. Chargers
+  without a passcode are unaffected.
 
 ## [0.4.0] - 2026-08-01
 

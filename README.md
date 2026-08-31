@@ -53,13 +53,26 @@ registered clients and `esp_ble_passkey_reply()` is keyed by the peer's BD addre
 rather than by connection. A `ble_client` with `auto_connect: false` therefore never
 opens a connection of its own (so it does not compete for the charger's single
 connection slot), but still sees the passkey request for that address and can answer
-it — including for the link the proxy opened.
+it — including for the link the proxy opened. Home Assistant starts that pairing by
+calling `bluetooth_device_pair` (`esp_ble_set_encryption()` on the ESP32) as soon as
+it connects, so you still enter the passcode in Home Assistant too.
 
-Add this to the proxy's ESPHome config, using your charger's MAC and passcode:
+#### Components needed on the proxy
+
+| Component | Why | Notes |
+| --- | --- | --- |
+| `esp32_ble` | `io_capability: keyboard_only` — **without this the ESP32 advertises NoInputNoOutput and can only do "Just Works"** | Must be listed explicitly; the default is `none` |
+| `esp32_ble_tracker` | Owns the client list that GAP security events are fanned out to | Auto-loaded, but usually already present |
+| `bluetooth_proxy` | The proxy itself; `active: true` is required for connections | Needs `api:` |
+| `ble_client` | Hosts the `on_passkey_request` automation that answers the passkey | Auto-loads `esp32_ble_client` |
+
+#### Configuration
 
 ```yaml
 esp32_ble:
   io_capability: keyboard_only   # default is "none" => Just Works only
+  auth_req_mode: bond_mitm       # require MITM, and store the bond
+  max_connections: 4             # 3 proxy slots + 1 for the ble_client below
 
 esp32_ble_tracker:
 
@@ -68,21 +81,37 @@ bluetooth_proxy:
 
 ble_client:
   - id: wallbox_passkey
-    mac_address: 54:64:DE:92:BC:7C
-    auto_connect: false          # never connect; only answer the passkey
+    mac_address: 54:64:DE:92:BC:7C   # your charger
+    auto_connect: false              # never connect; only answer the passkey
     on_passkey_request:
       then:
         - ble_client.passkey_reply:
             id: wallbox_passkey
-            passkey: 123456
+            passkey: 123456          # your Bluetooth Passcode
 ```
 
-Still enter the passcode in Home Assistant as well: it is what makes the integration
-ask the proxy to start pairing (`bluetooth_device_pair`, i.e. `esp_ble_set_encryption`
-on the ESP32) instead of assuming an unencrypted link. Requires ESPHome 2024.3.0 or
-newer on the proxy. Note that the helper `ble_client` consumes one of the ESP32's
-connection slots, so raise `esp32_ble_tracker: max_connections` if the proxy is
-already fully booked.
+**`max_connections` is the part that is easy to get wrong.** The helper `ble_client`
+consumes a connection slot of its own, so with the defaults (`max_connections: 3`,
+three proxy slots) the budget is overrun and ESPHome warns:
+
+```
+WARNING BLE components require 4 connection slot(s) but only 3 configured.
+        Components: bluetooth_proxy, bluetooth_proxy, bluetooth_proxy, ble_client
+```
+
+Ignore it and the fourth client fails at runtime with `ESP_GATT_NO_RESOURCES`. Raise
+`max_connections` to 4 as above, or keep the default RAM budget by giving the proxy
+one slot fewer with `bluetooth_proxy: connection_slots: 2`.
+
+#### Version notes
+
+Verified against ESPHome 2026.9.0-dev and 2024.3.0 (`esphome config`). 2024.3.0 is
+the floor — it is where `bluetooth_proxy` gained the `PAIRING` feature flag that
+`bluetooth_device_pair` needs. On that vintage `esp32_ble` has no `max_connections`
+or `auth_req_mode` key and there is no slot accounting at all: drop both lines and
+budget by hand with a two-entry `bluetooth_proxy: connections:` list instead. On
+current ESPHome that legacy `connections:` list is still accepted but no longer
+changes the slot count — use `connection_slots:` there.
 
 Chargers without a passcode keep working over a proxy with no extra configuration.
 
