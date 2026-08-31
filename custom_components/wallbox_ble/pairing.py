@@ -21,11 +21,16 @@ So we open our own system-bus connection, export an ``org.bluez.Agent1`` with
 the ``KeyboardOnly`` capability on it, and call ``Pair()`` from that same
 connection -- which makes BlueZ route ``RequestPasskey`` back to us.
 
-This is Linux/BlueZ only. Pairing a charger reached through an ESPHome
-Bluetooth proxy is not possible: ESPHome's ``esp32_ble_client`` only handles
-``ESP_GAP_BLE_SEC_REQ_EVT`` (auto-accept) and ``ESP_GAP_BLE_AUTH_CMPL_EVT``, it
-never handles ``ESP_GAP_BLE_PASSKEY_REQ_EVT``, so the proxy can only do
-"Just Works". Such a charger needs a local Bluetooth adapter in range.
+This module is Linux/BlueZ only, so it covers chargers reached through Home
+Assistant's own adapter. A charger reached through an ESPHome Bluetooth proxy
+pairs on the proxy instead: ESPHome's ``bluetooth_proxy`` handles only
+``ESP_GAP_BLE_SEC_REQ_EVT`` (auto-accept) and ``ESP_GAP_BLE_AUTH_CMPL_EVT``, and
+no API message carries a passkey, so the passcode has to be configured on the
+ESP32. A non-connecting ``ble_client`` with an ``on_passkey_request`` automation
+does that -- ``esp32_ble`` fans every GAP security event out to all registered
+clients and ``esp_ble_passkey_reply()`` is keyed by BD address, not by
+connection, so it answers for the proxy's link too. See the README for the YAML;
+``WallboxBLEApiClient._async_pair_over_link`` drives the proxy side from here.
 """
 
 import asyncio
@@ -224,9 +229,10 @@ async def _resolve_device(bus, address, adapter):
     path = _find_device_path(objects, address, adapter)
     if path is None:
         raise PairingUnsupported(
-            f"{address} is not known to any local BlueZ adapter. Passkey pairing "
-            "needs a Bluetooth adapter on the Home Assistant host within range "
-            "of the charger; ESPHome Bluetooth proxies cannot enter a PIN."
+            f"{address} is not known to any local BlueZ adapter. If it is served "
+            "by an ESPHome Bluetooth proxy, configure the passcode on the proxy "
+            "(esp32_ble io_capability: keyboard_only plus a non-connecting "
+            "ble_client with an on_passkey_request automation) -- see the README."
         )
     return path, await _get_interface(bus, path, DEVICE_INTERFACE)
 
@@ -354,9 +360,9 @@ def async_adapter_for_address(hass, address):
     """Name of the local BlueZ adapter Home Assistant sees ``address`` on.
 
     Returns None when the charger is only reachable through a remote scanner
-    (an ESPHome Bluetooth proxy), which is also the case where pairing cannot
-    work at all -- remote scanner "adapters" are not hciN devices, so the
-    pattern match rejects them.
+    (an ESPHome Bluetooth proxy), which is the case where the passkey has to be
+    answered on the proxy instead -- remote scanner "adapters" are not hciN
+    devices, so the pattern match rejects them.
     """
     try:
         from homeassistant.components.bluetooth import (

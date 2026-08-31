@@ -229,16 +229,25 @@ class WallboxBLEApiClient:
         if self.pin is None and not allow_just_works:
             return False
 
+        if self._pairing_unsupported_logged:
+            # Already established that BlueZ does not know this charger. Skip
+            # straight to the proxy path rather than repeating a D-Bus lookup
+            # that cannot succeed -- a failing link retries this once a second.
+            return await self._async_pair_over_link()
+
         adapter = async_adapter_for_address(self.hass, self.address)
         try:
             await async_bluez_ensure_paired(self.address, self.pin, adapter)
         except PairingUnsupported as e:
-            # Reached through an ESPHome Bluetooth proxy, or no BlueZ at all.
-            # Log once -- repeating it every reconnect buries the real error.
+            # Not on a local BlueZ adapter -- normally an ESPHome Bluetooth
+            # proxy. We cannot answer the passkey ourselves there, but the proxy
+            # can: see _async_pair_over_link.
             if not self._pairing_unsupported_logged:
                 self._pairing_unsupported_logged = True
-                LOGGER.warning("Cannot pair with %s: %s", self.address, e)
-            return False
+                LOGGER.warning(
+                    "Cannot pair with %s from Home Assistant: %s", self.address, e
+                )
+            return await self._async_pair_over_link()
         except PairingAuthError as e:
             # A wrong passcode never fixes itself; flag it so the coordinator
             # can trigger a reauth flow rather than reconnect forever.
@@ -250,6 +259,42 @@ class WallboxBLEApiClient:
             return False
 
         self.pairing_auth_failed = False
+        return True
+
+    async def _async_pair_over_link(self):
+        """Ask the transport to run SMP on the connection it already owns.
+
+        For an ESPHome Bluetooth proxy, bleak's ESPHome backend maps pair() to
+        the proxy's bluetooth_device_pair, i.e. esp_ble_set_encryption(), which
+        starts the SMP exchange over the proxy's own link.
+
+        The passkey has to come from the proxy, because the passkey request
+        never leaves the ESP32: bluetooth_proxy handles only SEC_REQ and
+        AUTH_CMPL, and there is no API message carrying a passkey. It can still
+        be answered on the proxy itself -- esp32_ble fans every GAP security
+        event out to all registered clients, and esp_ble_passkey_reply() is
+        keyed by BD address rather than by connection -- so a non-connecting
+        ble_client with the charger's MAC and an on_passkey_request automation
+        answers for the proxy's connection. See the README for that YAML.
+        """
+        if not (self.client and self.client.is_connected):
+            # Called before connecting; the post-connect retry path will get
+            # another go once the link is up.
+            return False
+        try:
+            await self.client.pair()
+        except NotImplementedError:
+            LOGGER.debug(
+                "The Bluetooth proxy serving %s is too old to pair "
+                "(needs ESPHome 2024.3.0 or newer)",
+                self.address,
+            )
+            return False
+        except Exception as e:
+            LOGGER.debug("Pairing over the existing link with %s failed: %s",
+                         self.address, e)
+            return False
+        LOGGER.debug("Paired with %s over the existing link", self.address)
         return True
 
     async def authenticate(self):
@@ -324,6 +369,8 @@ class WallboxBLEApiClient:
                     await self.client.start_notify(self.tx_uuid, callback_handler)
                 except Exception as e:
                     LOGGER.debug(f"start_notify failed ({e}); pairing and retrying")
+                    # Now that the link is up, a proxy-served charger can pair
+                    # over it -- which the pre-connect attempt could not do.
                     if not await self.async_ensure_paired(allow_just_works=True):
                         raise
                     await self.client.start_notify(self.tx_uuid, callback_handler)
@@ -397,8 +444,9 @@ class WallboxBLEApiClient:
         self.hass = hass
         self.address = address
         self.last_success = 0.0
-        # Log the "pairing needs a local adapter" hint once per client instead
-        # of on every reconnect attempt.
+        # Set once BlueZ turns out not to know this charger (it is served by a
+        # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
+        # lookup on every later reconnect.
         self._pairing_unsupported_logged = False
         # Shared reconnect signal: set by the disconnected_callback AND by
         # request() when a write is abandoned, so run_ble_client rebuilds the

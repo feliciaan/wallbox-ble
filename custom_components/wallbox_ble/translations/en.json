@@ -26,7 +26,7 @@
                 "data": {
                     "pin": "Bluetooth Passcode"
                 },
-                "description": "Chargers on firmware 6.11 or newer (all Pulsar Max and Pulsar Pro built after 1 August 2025) require a 6-digit Bluetooth Passcode. Find it in the Wallbox app on the charger information page. Leave this empty if your charger does not have one.\n\nEntering a passcode requires a Bluetooth adapter on the Home Assistant host within range of the charger — ESPHome Bluetooth proxies cannot enter a passcode."
+                "description": "Chargers on firmware 6.11 or newer (all Pulsar Max and Pulsar Pro built after 1 August 2025) require a 6-digit Bluetooth Passcode. Find it in the Wallbox app on the charger information page. Leave this empty if your charger does not have one.\n\nIf the charger is reached through an ESPHome Bluetooth proxy rather than a local Bluetooth adapter, the passcode must also be configured on the proxy — see the integration's README."
             },
             "reauth_confirm": {
                 "data": {

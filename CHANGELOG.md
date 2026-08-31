@@ -35,10 +35,17 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   connection so BlueZ routes `RequestPasskey` back to us. This mirrors the
   `botts7/esp32-wallbox` reference gateway's NimBLE `BLE_HS_IO_KEYBOARD_ONLY` +
   `onPassKeyRequest()`.
-- Passcode pairing requires a Bluetooth adapter on the Home Assistant host.
-  ESPHome Bluetooth proxies cannot enter a passkey: `esp32_ble_client` handles
-  only `ESP_GAP_BLE_SEC_REQ_EVT` and `ESP_GAP_BLE_AUTH_CMPL_EVT`, never
-  `ESP_GAP_BLE_PASSKEY_REQ_EVT`. Chargers without a passcode are unaffected.
+- Through an ESPHome Bluetooth proxy the passcode has to be configured on the
+  ESP32: `bluetooth_proxy` handles only `ESP_GAP_BLE_SEC_REQ_EVT` and
+  `ESP_GAP_BLE_AUTH_CMPL_EVT`, and no API message carries a passkey. It still
+  works, because `esp32_ble` fans every GAP security event out to all registered
+  clients and `esp_ble_passkey_reply()` is keyed by BD address rather than by
+  connection — so a `ble_client` with `auto_connect: false` (which never opens a
+  connection of its own) answers `on_passkey_request` for the proxy's link. The
+  integration drives the proxy side by falling back to `BleakClient.pair()`
+  (`bluetooth_device_pair` → `esp_ble_set_encryption`) when the charger is not on
+  a local BlueZ adapter; requires ESPHome 2024.3.0 or newer. See the README for
+  the YAML. Chargers without a passcode are unaffected.
 
 ## [0.4.0] - 2026-08-01
 
