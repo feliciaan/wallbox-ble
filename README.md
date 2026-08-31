@@ -141,9 +141,23 @@ characteristic, so a rejected write is the first sign. Check, in order:
    request arrive. `ESP_GATT_NO_RESOURCES` there means the connection-slot budget is
    still overrun.
 
-If the proxy log shows a *numeric comparison* request rather than a passkey request,
-the charger chose a different pairing method — use `on_numeric_comparison_request`
-with `ble_client.numeric_comparison_reply` instead.
+##### Decoding `Pairing failed due to error: N`
+
+A proxy reports the ESP-IDF SMP failure reason as a bare number. Bluedroid offsets
+SMP status codes by `BTA_DM_AUTH_FAIL_BASE`, which is `HCI_ERR_MAX_ERR` (0x43) + 10
+= **77** (`bta_api.h`), so subtract 77 to get the SMP code. The integration does this
+for you and logs the meaning; the common ones are:
+
+| Reported | SMP | Meaning |
+| --- | --- | --- |
+| 78 | 0x01 passkey entry failed | The charger rejected the passcode — check it in the Wallbox app |
+| 80 | 0x03 authentication requirements | The charger wants a passkey but the proxy has no way to enter one — `io_capability` is still `none` |
+| 81 | 0x04 confirm value failed | Passcode mismatch |
+| 86 | 0x09 repeated attempts | The charger is rate-limiting after earlier failures — wait a few minutes or power-cycle it |
+| 89 | 0x0C numeric comparison failed | The charger chose numeric comparison — use `on_numeric_comparison_request` with `ble_client.numeric_comparison_reply` |
+| 102 | 0x19 SMP timed out | Pairing started and nothing answered — usually no `on_passkey_request` for this MAC, or the MAC does not match |
+
+Values of 77 or below are plain HCI errors, not SMP codes.
 
 ## Implemented features
  - charger status

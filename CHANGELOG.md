@@ -44,7 +44,13 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   clients fought over the charger's single connection slot and each logged its
   own copy of every failure.
 - Warnings from the connect path are logged once per client instead of once per
-  reconnect attempt, which is every second while a link is failing.
+  reconnect attempt, which is every second while a link is failing — keyed by
+  cause, so a changing failure is still reported.
+- A Bluetooth proxy's bare pairing error number is now decoded. ESPHome forwards
+  ESP-IDF's `auth_cmpl.fail_reason`, which Bluedroid offsets by
+  `BTA_DM_AUTH_FAIL_BASE` (`HCI_ERR_MAX_ERR` 0x43 + 10 = 77), so e.g. `error: 80`
+  is SMP 0x03 "authentication requirements" and `error: 102` is SMP 0x19 "timed
+  out". The log now names the code and what to change.
 - The "cannot pair from Home Assistant" warning now says what happens next
   (falling back to the proxy, which needs the passcode configured on the proxy).
   Home Assistant Container installs have no system D-Bus at all, so that message

@@ -54,6 +54,69 @@ AUTH_ERROR_TEXTS = (
 )
 
 
+# An ESPHome proxy reports the ESP-IDF SMP failure reason verbatim, as a bare
+# number ("Pairing failed due to error: 80"). Bluedroid offsets SMP status codes
+# by BTA_DM_AUTH_FAIL_BASE, which is HCI_ERR_MAX_ERR (0x43) + 10 = 77
+# (bta_api.h), so anything in 78..102 decodes back to an SMP code. Plain HCI
+# errors stop at 0x43, so there is no overlap.
+BTA_DM_AUTH_FAIL_BASE = 77
+SMP_FAILURES = {
+    0x01: (
+        "passkey entry failed",
+        "the charger rejected the passcode the proxy sent -- check it in the "
+        "Wallbox app on the charger information page",
+    ),
+    0x03: (
+        "authentication requirements",
+        "the charger requires a passkey but the proxy offered no way to enter "
+        "one. Set 'io_capability: keyboard_only' under esp32_ble and add the "
+        "ble_client on_passkey_request automation -- see the README",
+    ),
+    0x04: (
+        "confirm value failed",
+        "the passcode did not match; check it in the Wallbox app",
+    ),
+    0x05: (
+        "pairing not supported",
+        "the charger refused to pair at all",
+    ),
+    0x06: (
+        "encryption key size",
+        "the charger wants a longer key than the proxy offers",
+    ),
+    0x08: ("unknown pairing failure", "no further detail from the charger"),
+    0x09: (
+        "repeated attempts",
+        "the charger is rate-limiting pairing after earlier failures; leave it "
+        "alone for a few minutes, or power-cycle it, before retrying",
+    ),
+    0x0C: (
+        "numeric comparison failed",
+        "the charger chose numeric comparison rather than passkey entry -- the "
+        "proxy needs on_numeric_comparison_request instead of "
+        "on_passkey_request",
+    ),
+    0x19: (
+        "timed out",
+        "pairing started but nothing answered it. Usually the proxy has no "
+        "on_passkey_request automation for this charger's MAC address, or the "
+        "MAC in that automation does not match",
+    ),
+}
+
+
+def _describe_pair_error(exc):
+    """Turn a proxy's bare SMP failure number into something actionable."""
+    match = re.search(r"error:?\s*(\d+)", str(exc))
+    if match is None:
+        return None
+    code = int(match.group(1)) - BTA_DM_AUTH_FAIL_BASE
+    if code not in SMP_FAILURES:
+        return None
+    name, advice = SMP_FAILURES[code]
+    return f"SMP {name} (0x{code:02x}) -- {advice}"
+
+
 def _is_auth_error(exc) -> bool:
     """True when a GATT failure means the link needs (better) pairing."""
     if exc is None:
@@ -334,11 +397,12 @@ class WallboxBLEApiClient:
             )
             return False
         except Exception as e:
+            detail = _describe_pair_error(e)
             self._warn_once(
-                "proxy_pair_failed",
+                f"proxy_pair_failed:{detail or e}",
                 "Pairing %s through the Bluetooth proxy failed: %s",
                 self.address,
-                e,
+                detail or e,
             )
             return False
         LOGGER.debug("Paired with %s over the existing link", self.address)
