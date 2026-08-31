@@ -37,6 +37,18 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 - A rejected write now logs one actionable error naming the fix — set the
   passcode, or configure it on the proxy — rather than repeating a raw
   `BleakError` per chunk per poll.
+- The BLE client task is now cancelled when the config entry unloads. It never
+  was, so every reload — including the coordinator's own 180s self-heal, which
+  fires exactly when a charger is refusing commands — left the previous
+  `run_ble_client()` looping forever. The orphans kept reconnecting, so several
+  clients fought over the charger's single connection slot and each logged its
+  own copy of every failure.
+- Warnings from the connect path are logged once per client instead of once per
+  reconnect attempt, which is every second while a link is failing.
+- The "cannot pair from Home Assistant" warning now says what happens next
+  (falling back to the proxy, which needs the passcode configured on the proxy).
+  Home Assistant Container installs have no system D-Bus at all, so that message
+  is expected there rather than a fault in itself.
 
 ### Notes
 

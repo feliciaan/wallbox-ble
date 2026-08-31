@@ -39,7 +39,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Handle removal of an entry."""
     if unloaded := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id)
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
+        if coordinator is not None:
+            # Must stop the BLE client task here: a reload unloads and sets up
+            # again, and an orphaned run_ble_client() would keep reconnecting
+            # forever alongside the new one.
+            await coordinator.async_shutdown()
     return unloaded
 
 

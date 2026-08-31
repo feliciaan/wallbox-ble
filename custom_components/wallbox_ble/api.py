@@ -239,6 +239,17 @@ class WallboxBLEApiClient:
                 return
         LOGGER.debug(f"No known BLE profile matched; using default UUIDs for {self.address}")
 
+    def _warn_once(self, key, msg, *args):
+        """Log a warning the first time only.
+
+        The reconnect loop retries every second while a link is failing, so an
+        unconditional warning here buries the rest of the log.
+        """
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        LOGGER.warning(msg, *args)
+
     async def async_ensure_paired(self, allow_just_works=False):
         """Bond with the charger over SMP so the encrypted link is up.
 
@@ -268,11 +279,16 @@ class WallboxBLEApiClient:
             # Not on a local BlueZ adapter -- normally an ESPHome Bluetooth
             # proxy. We cannot answer the passkey ourselves there, but the proxy
             # can: see _async_pair_over_link.
-            if not self._pairing_unsupported_logged:
-                self._pairing_unsupported_logged = True
-                LOGGER.warning(
-                    "Cannot pair with %s from Home Assistant: %s", self.address, e
-                )
+            self._pairing_unsupported_logged = True
+            self._warn_once(
+                "no_bluez",
+                "Cannot pair with %s from Home Assistant (%s). Falling back to "
+                "pairing through the Bluetooth proxy, which only works if the "
+                "passcode is configured on the proxy itself -- see the "
+                "integration README.",
+                self.address,
+                e,
+            )
             return await self._async_pair_over_link()
         except PairingAuthError as e:
             # A wrong passcode never fixes itself; flag it so the coordinator
@@ -310,15 +326,20 @@ class WallboxBLEApiClient:
         try:
             await self.client.pair()
         except NotImplementedError:
-            LOGGER.debug(
-                "The Bluetooth proxy serving %s is too old to pair "
-                "(needs ESPHome 2024.3.0 or newer)",
+            self._warn_once(
+                "proxy_too_old",
+                "The Bluetooth proxy serving %s is too old to pair; upgrade it "
+                "to ESPHome 2024.3.0 or newer",
                 self.address,
             )
             return False
         except Exception as e:
-            LOGGER.debug("Pairing over the existing link with %s failed: %s",
-                         self.address, e)
+            self._warn_once(
+                "proxy_pair_failed",
+                "Pairing %s through the Bluetooth proxy failed: %s",
+                self.address,
+                e,
+            )
             return False
         LOGGER.debug("Paired with %s over the existing link", self.address)
         return True
@@ -449,6 +470,26 @@ class WallboxBLEApiClient:
             # have arrived during the disconnect above; it is cleared at the top
             # of the loop just before the next connect.
 
+    async def async_shutdown(self):
+        """Stop the reconnect loop and drop the link.
+
+        Without this, every config entry reload -- including the coordinator's
+        own 180s self-heal, which fires exactly when a charger is refusing
+        commands -- leaves the previous run_ble_client() looping forever. The
+        orphans keep reconnecting, so several clients end up fighting over the
+        charger's single connection slot and every failure is logged once per
+        orphan.
+        """
+        task, self.client_task = self.client_task, None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        client, self.client = self.client, None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
     async def connection_established(self):
         while True:
             if self.client and self.client.is_connected:
@@ -481,6 +522,9 @@ class WallboxBLEApiClient:
         # an authentication rejection apart from a wedged or dead link.
         self._last_write_exc = None
         self._auth_help_logged = False
+        # Keys of warnings already emitted, so a second-by-second reconnect loop
+        # reports each distinct problem once.
+        self._warned = set()
         # Set once BlueZ turns out not to know this charger (it is served by a
         # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
         # lookup on every later reconnect.

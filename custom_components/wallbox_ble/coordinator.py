@@ -53,6 +53,11 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self.wb = await WallboxBLEApiClient.create(hass, address, pin)
         return self
 
+    async def async_shutdown(self):
+        """Stop polling and tear down the BLE client task with the entry."""
+        await super().async_shutdown()
+        await self.wb.async_shutdown()
+
     async def async_refresh_later(self, delay):
         async def wrap(*_):
             await self.async_refresh()
