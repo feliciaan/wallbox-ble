@@ -54,6 +54,20 @@ automations cover.
 
 ### Fixed
 
+- **An unanswered request no longer hangs polling for good, and Home Assistant can
+  shut down cleanly.** The reply parser wrapped everything in a bare `except:`,
+  which also catches `asyncio.CancelledError`. asyncio delivers a timeout as a
+  cancellation, so the 2 s response timeout was swallowed: a request the charger
+  never answered waited forever, freezing every sensor, and the 180 s self-heal never
+  ran because it lives inside the stuck poll. At shutdown the same swallow produced
+  "Task could not be canceled and was still running after shutdown" for the refresh
+  task. Only incomplete JSON (keep reading) and complete-but-foreign frames (drop
+  them) are handled now. The old code also kept a complete frame without our `id` in
+  the buffer, so no later reply could parse. Reproduced on Python 3.11 and 3.13; the
+  original code had the bug, and the extra reads added in this release made it
+  likelier to trigger.
+- Removed `connection_established()`. It was never called, and it busy-looped on an
+  un-awaited `asyncio.sleep`, which would have frozen the event loop if anything had.
 - **Status code 19 ("connected, no current") no longer breaks every poll.** The status
   list stopped at 18 and the lookup indexed it directly, raising `IndexError`; Power
   Boost holding current back is exactly when 19 appears. Unknown codes now show as

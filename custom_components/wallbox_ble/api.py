@@ -39,6 +39,9 @@ STALE_RECONNECT_S = 60
 # so control always returns to the caller after WRITE_TIMEOUT_S.
 WRITE_TIMEOUT_S = 2
 
+# How long request() waits for the charger's reply before giving up.
+RESPONSE_TIMEOUT_S = 2
+
 # ATT/GATT status codes meaning "this link is not paired well enough for that
 # operation". BlueZ reports the ATT error and the ESPHome proxy reports
 # esp_gatt_status_t, which uses the same values here. Note that 0x05 also covers
@@ -573,12 +576,6 @@ class WallboxBLEApiClient:
             with contextlib.suppress(Exception):
                 await client.disconnect()
 
-    async def connection_established(self):
-        while True:
-            if self.client and self.client.is_connected:
-                return
-            asyncio.sleep(0.1)
-
     @classmethod
     async def create(cls, hass, address, pin=None):
         self = WallboxBLEApiClient()
@@ -629,10 +626,20 @@ class WallboxBLEApiClient:
     async def get_parsed_response(self, request_id):
         data = bytearray()
         while True:
+            # Deliberately outside the try: CancelledError must propagate. A
+            # bare `except:` here used to swallow it, which (a) defeated the
+            # response timeout -- asyncio delivers a timeout as a cancellation
+            # -- so an unanswered request hung polling for good, and (b) left
+            # Home Assistant unable to cancel the refresh task at shutdown.
+            data += await self.rx_queue.get()
             try:
-                data += await self.rx_queue.get()
                 parsed_data = json.loads(data)
-                LOGGER.debug(f"Got {parsed_data=}")
+            except ValueError:
+                # Replies arrive split over several notifications; keep
+                # reading until the JSON is complete.
+                continue
+            LOGGER.debug(f"Got {parsed_data=}")
+            try:
                 if parsed_data["id"] == request_id:
                     # A BAPI error has no "r", so callers would just see None;
                     # keep the error so they can tell "not supported" (e.g.
@@ -642,10 +649,13 @@ class WallboxBLEApiClient:
                     # (fw_v_ puts its fields at the top level).
                     self.last_response = parsed_data
                     return parsed_data.get("r")
-                else:
-                    data = bytearray()
-            except:
+            except (KeyError, TypeError):
                 pass
+            # A complete frame that is not the answer to this request (an
+            # earlier request's late reply, or not a reply at all): drop it, or
+            # it would stay in front of the real answer and nothing after it
+            # would parse.
+            data = bytearray()
 
     def clear_rx_queue(self):
         self.rx_queue = asyncio.Queue()
@@ -789,7 +799,9 @@ class WallboxBLEApiClient:
             return False, None
 
         try:
-            response = await asyncio.wait_for(self.get_parsed_response(request_id), 2)
+            response = await asyncio.wait_for(
+                self.get_parsed_response(request_id), RESPONSE_TIMEOUT_S
+            )
             LOGGER.debug("Got response!")
             self.last_success = asyncio.get_running_loop().time()
             return True, response
