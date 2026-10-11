@@ -21,6 +21,7 @@ Timers are scaled down so a scenario takes about a second.
 """
 import asyncio
 import json
+import logging
 import types
 
 import pytest
@@ -57,6 +58,10 @@ REPLY_START_S = 2.0  # until the first piece of a reply
 REPLY_GAP_S = 0.15  # between pieces
 LATE_START_S = 10.0  # a reply that starts after the first-piece timeout
 STALL_S = 4.5  # a mid-reply pause longer than the between-pieces timeout
+LINK_TIMEOUT_S = 8.0  # a silently dead link until the proxy reports the disconnect
+LINK_LOST_ERROR = ("Peripheral 54:64:DE:92:BC:7C changed connection status while "
+                   "waiting for BluetoothGATTWriteResponse, BluetoothGATTErrorResponse: "
+                   "Insufficient authorization (8)")
 
 FIELD_ANSWERS = {
     "r_dat": {"L1": 0, "L2": 0, "L3": 0, "cp": 0.0, "cur": 32, "den": 0, "en": 0,
@@ -83,7 +88,8 @@ class Charger:
     def __init__(self, profile="pulsar_max", pin=None, meter="voltage",
                  first_delay=0.0, chunk_delay=0.0, silent=(), notify_failures=0,
                  proxy_has_passkey=True, pairing_wrong_pin=False,
-                 write_delay=0.0, faults=None, slow_writes=(), reappear_delay=0.0):
+                 write_delay=0.0, faults=None, slow_writes=(), reappear_delay=0.0,
+                 lose_link=None):
         self.profile = PROFILES[profile]
         self.pin = pin
         self.meter = METERS[meter]
@@ -97,6 +103,11 @@ class Charger:
         # Request ordinal (1-based, across links) -> "late" | "stall" | "drop".
         self.faults = dict(faults or {})
         self.faulted_ids = {}  # request id -> fault, as the client numbered it
+        # method -> which of its requests (1-based) the link dies under: the
+        # request gets no reply, writes stall, and the disconnect is reported
+        # LINK_TIMEOUT_S later, as a proxy does.
+        self.lose_link = {m: set(n) for m, n in (lose_link or {}).items()}
+        self.method_counts = {}
         # Write-call ordinals (1-based) that take SLOW_WRITE_S to confirm.
         self.slow_writes = set(slow_writes)
         self.writes = 0
@@ -192,6 +203,8 @@ class Link:
         self.desynced = False
         self.logins = 0
         self.pending = set()
+        self.dead = False
+        self.dropper = None
 
     # -- bleak API ---------------------------------------------------------
     async def start_notify(self, uuid, callback):
@@ -205,6 +218,12 @@ class Link:
     async def write_gatt_char(self, char, payload, response=True):
         if not self.is_connected:
             raise BleakError("Not connected")
+        if self.dead:
+            # The ATT response never comes; the proxy fails the write when
+            # it reports the disconnect.
+            while self.is_connected:
+                await asyncio.sleep(0.01)
+            raise BleakError(LINK_LOST_ERROR)
         uuid = char if isinstance(char, str) else char.uuid
         self.charger.writes += 1
         delay = self.charger.write_delay
@@ -261,12 +280,18 @@ class Link:
             self.charger.requests.append((body["met"], body["par"]))
             self.charger.request_ids.append(body["id"])
             fault = self.charger.faults.get(len(self.charger.requests))
+            met = body["met"]
+            self.charger.method_counts[met] = self.charger.method_counts.get(met, 0) + 1
+            if self.charger.method_counts[met] in self.charger.lose_link.get(met, ()):
+                fault = "lost"
+                self.dead = True
+                self.dropper = asyncio.ensure_future(self._die())
             if fault:
                 self.charger.faulted_ids[body["id"]] = fault
             if body["met"] == "suser":
                 self.logins += 1
             kind, value = self.charger.answer(body["met"], body["par"])
-            if kind is not None and fault != "drop":
+            if kind is not None and fault not in ("drop", "lost"):
                 task = asyncio.ensure_future(self._reply(body["id"], kind, value, fault))
                 self.pending.add(task)
                 task.add_done_callback(self.pending.discard)
@@ -301,6 +326,10 @@ class Link:
                 await asyncio.sleep(scaled(STALL_S))
             await self.notify(None, bytearray(data[i:i + 20]))
             await asyncio.sleep(self.charger.chunk_delay)
+
+    async def _die(self):
+        await asyncio.sleep(scaled(LINK_TIMEOUT_S))
+        await self._drop()
 
     async def _drop(self, notify=True):
         if not self.is_connected:
@@ -406,6 +435,8 @@ class Run:
         for link in self.charger.links:
             for task in list(link.pending):
                 task.cancel()
+            if link.dropper:
+                link.dropper.cancel()
         await asyncio.sleep(0)
 
 
@@ -731,3 +762,37 @@ def test_field_link(monkeypatch):
     assert c.meter.measured_power == 351 and c.voltage == 230 and c.voltage_source == "meter"
     assert c.house_power == 351  # charger idle: everything is the house
     assert c.realtime.get("grid") is None  # this firmware has no lifetime counter
+
+
+def test_link_lost_during_meter_reads(monkeypatch, caplog):
+    """Field log, 17:58-18:01: the proxy link died under r_dca three polls
+    running (no reply, then the disconnect ~8 s later, a pending write failing
+    with "Insufficient authorization (8)"). The meter, answering fine before,
+    was dropped for good and the grid sensors froze; the failed write was
+    reported as a rejected passcode.
+    """
+    charger = Charger(
+        first_delay=scaled(REPLY_START_S), chunk_delay=scaled(REPLY_GAP_S),
+        write_delay=scaled(WRITE_S), silent={"g_halocfg"},
+        lose_link={"r_dca": {2, 3, 4}},
+    )
+    charger.field = True
+
+    async def body(run):
+        for _ in range(40):
+            await run.poll()
+            if charger.method_counts.get("r_dca", 0) >= 6:
+                break
+            await asyncio.sleep(scaled(1))
+        return run
+
+    with caplog.at_level(logging.DEBUG, logger="custom_components.wallbox_ble"):
+        run = run_scenario(monkeypatch, charger, body=body)
+
+    assert len(charger.links) >= 4, "the link losses were not simulated"
+    assert charger.method_counts.get("r_dca", 0) >= 6, (
+        f"r_dca not asked again after the link losses: {charger.method_counts}")
+    assert "r_dca" not in run.c._skipped
+    assert run.c.meter is not None and run.c.meter.measured_power == 351
+    errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert not errors, errors

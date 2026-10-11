@@ -94,6 +94,21 @@ result; this file is the record of how we got there.
   did the slow settings read, the gap was 30 s. Now the last values are kept until
   three polls in a row are missed.
 
+### Link losses taken for unsupported reads
+- An optional read left unanswered three polls running was dropped until reload,
+  on the reasoning that the status read in the same poll had just answered. But the
+  proxy link dies silently every few minutes, and whichever read is in flight gets
+  no reply. Three losses under `r_dca` dropped the working meter, and the grid and
+  house sensors froze at their last value.
+- The same losses fail a pending write with "changed connection status ...
+  Insufficient authorization (8)". The 8 is the HCI disconnect reason (connection
+  timeout), printed with the ATT error's name, and it was reported as a rejected
+  passcode.
+- **Fix:** only a read that has never answered can be dropped; "changed connection
+  status" is a lost link, not an authentication error.
+- **Lesson:** "the link answered a moment ago" does not mean it is still up; a
+  dropped request is not evidence about the method.
+
 ## Testing
 
 ### Tests passed while the field failed
@@ -101,4 +116,5 @@ result; this file is the record of how we got there.
   any of the request-handling failures above. It caught them only once it replayed a
   field log: per-chunk latency, slow writes, late and stalled replies, and real
   payloads, with timers scaled by one factor so their ratios match production.
+  Even then it missed the silent link drop above until that was modelled too.
 - **Lesson:** model the slow transport first; derive simulation timings from logs.

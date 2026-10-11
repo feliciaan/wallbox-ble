@@ -42,8 +42,10 @@ own health sensors and schedules, which Home Assistant automations cover.
   reply, 3 s between pieces, 20 s in all; 10 s per write. Leftovers of a late reply are
   dropped, and request ids are sequential.
 - Settings and slow counters are read every 5 minutes, identity once per connection;
-  a write re-reads them at once. A read the charger never answers is skipped after
-  three tries.
+  a write re-reads them at once. A read the charger has never answered is skipped
+  after three tries; one it has answered is always asked again.
+- A link that drops mid-request is treated as a lost link and reconnected, not
+  reported as a rejected passcode.
 - A missed status reply keeps the last values; the device goes unavailable only after
   three missed polls in a row.
 - The session login is retried on the first successful status read.

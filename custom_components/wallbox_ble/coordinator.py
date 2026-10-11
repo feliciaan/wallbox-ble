@@ -27,10 +27,12 @@ SELF_RELOAD_STALE_S = 180
 # traffic over the Bluetooth proxy down. A write refreshes them immediately.
 SLOW_POLL_S = 300
 
-# An optional read the charger leaves unanswered this many polls in a row,
-# while answering the status read in the same poll, is taken as unsupported
-# and not asked for again until the entry reloads. Each unanswered read costs
-# the full response timeout on every poll otherwise.
+# An optional read the charger has never answered, left unanswered this many
+# polls in a row while the status read in the same poll was answered, is taken
+# as unsupported and not asked for again until the entry reloads. Each
+# unanswered read costs the full response timeout on every poll otherwise. A
+# read that has answered before is supported: its misses are the link dropping
+# mid-request, so it is always asked again.
 MAX_UNANSWERED = 3
 
 # Polls in a row without a status reply before the entities go unavailable.
@@ -94,6 +96,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         # Optional reads: consecutive unanswered polls, and those given up on.
         self._unanswered = {}
         self._skipped = set()
+        self._answered = set()
 
     @classmethod
     async def create(cls, hass, address, pin=None):
@@ -194,22 +197,23 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
     async def _read_optional(self, method):
         """async_read for anything but the core status read.
 
-        Only called after r_dat has answered in the same poll, so a timeout
-        here means the charger ignores this method rather than that the link
-        is down. Other failures (write rejected, link lost) are not counted.
+        Only called after r_dat has answered in the same poll. A method that
+        has never answered and keeps timing out is dropped (MAX_UNANSWERED);
+        other failures (write rejected, link lost) are not counted.
         """
         if method in self._skipped:
             return False, None, None, None
         ok, result, error, response = await self.wb.async_read(method)
         if ok:
+            self._answered.add(method)
             self._unanswered.pop(method, None)
-        elif self.wb.last_failure == "timeout":
+        elif self.wb.last_failure == "timeout" and method not in self._answered:
             misses = self._unanswered.get(method, 0) + 1
             self._unanswered[method] = misses
             if misses >= MAX_UNANSWERED:
                 self._skipped.add(method)
                 LOGGER.warning(
-                    "Charger did not answer %s %d polls in a row while otherwise "
+                    "Charger has not answered %s in %d polls while otherwise "
                     "responding; no longer asking for it until the integration "
                     "reloads", method, misses,
                 )

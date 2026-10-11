@@ -306,7 +306,7 @@ def test_unanswered_read_is_dropped_after_three_polls(caplog):
     for _ in range(3):
         run_poll(c)
     assert "r_sta" in c._skipped
-    assert sum("did not answer r_sta" in r.message for r in caplog.records) == 1
+    assert sum("not answered r_sta" in r.message for r in caplog.records) == 1
     c.wb.reads.clear()
     run_poll(c)
     assert "r_sta" not in c.wb.reads, "kept asking a read the charger ignores"
@@ -336,6 +336,23 @@ def test_only_timeouts_count():
     for _ in range(5):
         run_poll(c)
     assert not c._skipped
+
+
+def test_a_read_that_answered_before_is_never_dropped():
+    # Field log: the link dropped during r_dca three polls running, and the
+    # meter was dropped for good while it was fitted and working.
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    assert c.meter is not None
+    c.wb.silent.add("r_dca")
+    for _ in range(coordinator_mod.MAX_UNANSWERED + 3):
+        run_poll(c)
+    assert "r_dca" not in c._skipped
+    c.wb.silent.clear()
+    c.wb.answers["r_dca"] = {"c1": 50, "c2": 0, "c3": 0, "p1": 0, "v1": 0, "e": 0}
+    c.wb.reads.clear()
+    run_poll(c)
+    assert "r_dca" in c.wb.reads and c.meter.grid_current == 5.0
 
 
 def test_status_read_is_never_dropped():

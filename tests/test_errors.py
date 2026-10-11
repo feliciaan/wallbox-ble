@@ -30,6 +30,11 @@ def test_auth_errors_are_recognised(message):
         Exception("Bluetooth GATT Error address=X handle=23 error=3 description=Write not permitted"),
         Exception("Bluetooth GATT Error address=X handle=23 error=-1 description=Disconnected"),
         Exception("Characteristic not found"),
+        # Verbatim from a field log: the link dropped mid-write; the 8 is the
+        # HCI disconnect reason (connection timeout), not an ATT error.
+        Exception("Peripheral 54:64:DE:92:BC:7C changed connection status while waiting "
+                  "for BluetoothGATTWriteResponse, BluetoothGATTErrorResponse: "
+                  "Insufficient authorization (8)"),
         TimeoutError("timed out"),
         None,
     ],

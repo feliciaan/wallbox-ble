@@ -72,6 +72,12 @@ AUTH_ERROR_TEXTS = (
     "insufficient authorization",
     "not paired",
 )
+# A proxy link that drops while a request is in flight is reported as
+# "changed connection status while waiting for ..., BluetoothGATTErrorResponse:
+# Insufficient authorization (8)": the 8 is the HCI disconnect reason
+# (connection timeout) printed with the ATT error's name. That is a lost link,
+# not a pairing problem.
+LINK_LOST_TEXTS = ("changed connection status",)
 
 
 # An ESPHome proxy reports the ESP-IDF SMP failure reason verbatim, as a bare
@@ -144,6 +150,8 @@ def _is_auth_error(exc) -> bool:
     if exc is None:
         return False
     text = str(exc).lower()
+    if any(needle in text for needle in LINK_LOST_TEXTS):
+        return False
     if any(needle in text for needle in AUTH_ERROR_TEXTS):
         return True
     match = re.search(r"error=(-?\d+)", text)
@@ -921,7 +929,10 @@ class WallboxBLEApiClient:
                 # sane pace instead of one per poll.
                 self._log_auth_help()
                 return False, None
-            LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
+            if self._link_up:
+                LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
+            else:
+                LOGGER.debug("Link lost while sending %s; reconnecting", method)
             self._disconnected_event.set()
             return False, None
 
