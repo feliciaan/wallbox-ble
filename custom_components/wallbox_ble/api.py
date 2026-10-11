@@ -68,9 +68,11 @@ SMP_FAILURES = {
     ),
     0x03: (
         "authentication requirements",
-        "the charger requires a passkey but the proxy offered no way to enter "
-        "one. Set 'io_capability: keyboard_only' under esp32_ble and add the "
-        "ble_client on_passkey_request automation -- see the README",
+        "the proxy cannot meet the charger's security requirements. Under "
+        "esp32_ble it needs 'io_capability: keyboard_only' AND "
+        "'auth_req_mode: sc_mitm_bond' -- 'bond_mitm' drops Secure "
+        "Connections, which the charger also rejects with 0x03 -- plus the "
+        "ble_client on_passkey_request automation. See the README",
     ),
     0x04: (
         "confirm value failed",

@@ -62,6 +62,14 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   authentication rejection no longer forces a reconnect — reconnecting cannot
   authenticate a link. The 60 s health check still reconnects a link that stays
   unusable, which gives one fresh pairing attempt per minute.
+- README: the proxy YAML recommended `auth_req_mode: bond_mitm`, which clears the
+  Secure Connections bit and downgrades the ESP32 to LE legacy pairing — the
+  opposite of ESP-IDF's own default (`SC_MITM_BOND`, `bta_dm_co.c`) and of the
+  reference gateway's NimBLE `setSecurityAuth(bond, mitm, sc)`. A charger that
+  insists on Secure Connections rejects that with SMP 0x03, indistinguishable from
+  a missing `io_capability`. Now `sc_mitm_bond`, with a `logger.log` line in the
+  passkey automation so the proxy log shows whether the request arrives; the 0x03
+  hint in the integration's log names both causes.
 - A Bluetooth proxy's bare pairing error number is now decoded. ESPHome forwards
   ESP-IDF's `auth_cmpl.fail_reason`, which Bluedroid offsets by
   `BTA_DM_AUTH_FAIL_BASE` (`HCI_ERR_MAX_ERR` 0x43 + 10 = 77), so e.g. `error: 80`

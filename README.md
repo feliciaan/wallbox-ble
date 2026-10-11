@@ -61,7 +61,7 @@ it connects, so you still enter the passcode in Home Assistant too.
 
 | Component | Why | Notes |
 | --- | --- | --- |
-| `esp32_ble` | `io_capability: keyboard_only` — **without this the ESP32 advertises NoInputNoOutput and can only do "Just Works"** | Must be listed explicitly; the default is `none` |
+| `esp32_ble` | `io_capability: keyboard_only` — **without this the ESP32 advertises NoInputNoOutput and can only do "Just Works"**; `auth_req_mode: sc_mitm_bond` | Must be listed explicitly; the default is `none`. It is not auto-added with a useful value |
 | `esp32_ble_tracker` | Owns the client list that GAP security events are fanned out to | Auto-loaded, but usually already present |
 | `bluetooth_proxy` | The proxy itself; `active: true` is required for connections | Needs `api:` |
 | `ble_client` | Hosts the `on_passkey_request` automation that answers the passkey | Auto-loads `esp32_ble_client` |
@@ -71,7 +71,7 @@ it connects, so you still enter the passcode in Home Assistant too.
 ```yaml
 esp32_ble:
   io_capability: keyboard_only   # default is "none" => Just Works only
-  auth_req_mode: bond_mitm       # require MITM, and store the bond
+  auth_req_mode: sc_mitm_bond    # Secure Connections + MITM + bond — keep the SC part
   max_connections: 4             # 3 proxy slots + 1 for the ble_client below
 
 esp32_ble_tracker:
@@ -85,12 +85,21 @@ ble_client:
     auto_connect: false              # never connect; only answer the passkey
     on_passkey_request:
       then:
+        - logger.log: "Wallbox asked for the passkey; answering"
         - ble_client.passkey_reply:
             id: wallbox_passkey
             passkey: 123456          # your Bluetooth Passcode
 ```
 
-**`max_connections` is the part that is easy to get wrong.** The helper `ble_client`
+**Keep Secure Connections on.** Use `sc_mitm_bond`, not `bond_mitm`: the latter
+drops the Secure Connections bit (`ESP_LE_AUTH_REQ_SC_ONLY`, `0x08`) and falls back to
+LE legacy pairing, which the charger rejects with SMP 0x03 "authentication
+requirements" — the same error as a missing `io_capability`. `sc_mitm_bond` is also
+ESP-IDF's own default (`bte_appl_cfg` in `bta_dm_co.c`) and matches the reference
+gateway's NimBLE `setSecurityAuth(bond, mitm, sc)`. The `logger.log` line is optional,
+but it shows in the proxy log whether the passkey request ever arrives.
+
+**`max_connections` is the other part that is easy to get wrong.** The helper `ble_client`
 consumes a connection slot of its own, so with the defaults (`max_connections: 3`,
 three proxy slots) the budget is overrun and ESPHome warns:
 
@@ -151,7 +160,7 @@ for you and logs the meaning; the common ones are:
 | Reported | SMP | Meaning |
 | --- | --- | --- |
 | 78 | 0x01 passkey entry failed | The charger rejected the passcode — check it in the Wallbox app |
-| 80 | 0x03 authentication requirements | The charger wants a passkey but the proxy has no way to enter one — `io_capability` is still `none` |
+| 80 | 0x03 authentication requirements | The proxy cannot meet the charger's requirements: `io_capability` is still `none`, **or** `auth_req_mode` lacks Secure Connections (`bond_mitm` instead of `sc_mitm_bond`) |
 | 81 | 0x04 confirm value failed | Passcode mismatch |
 | 86 | 0x09 repeated attempts | The charger is rate-limiting after earlier failures — wait a few minutes or power-cycle it |
 | 89 | 0x0C numeric comparison failed | The charger chose numeric comparison — use `on_numeric_comparison_request` with `ble_client.numeric_comparison_reply` |
