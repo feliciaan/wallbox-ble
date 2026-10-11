@@ -85,7 +85,46 @@ class _SensorEntityDescription:
     native_unit_of_measurement: object = None
     entity_category: object = None
     entity_registry_enabled_default: bool = True
+    icon: str | None = None
 
+
+@dataclass(frozen=True, kw_only=True)
+class _EntityDescription:
+    key: str
+    name: str | None = None
+    device_class: object = None
+    entity_category: object = None
+    icon: str | None = None
+    options: list | None = None
+    native_min_value: float | None = None
+    native_max_value: float | None = None
+    native_step: float | None = None
+    native_unit_of_measurement: object = None
+    mode: object = None
+
+
+class _Entity:
+    def async_write_ha_state(self):
+        pass
+
+    def async_schedule_update_ha_state(self):
+        pass
+
+
+for _platform, _names in {
+    "binary_sensor": ("BinarySensorEntity", "BinarySensorEntityDescription"),
+    "button": ("ButtonEntity", "ButtonEntityDescription"),
+    "select": ("SelectEntity", "SelectEntityDescription"),
+    "switch": ("SwitchEntity", "SwitchEntityDescription"),
+    "number": ("NumberEntity", "NumberEntityDescription"),
+    "lock": ("LockEntity", "LockEntityDescription"),
+}.items():
+    _stub(f"homeassistant.components.{_platform}", **{_names[0]: _Entity, _names[1]: _EntityDescription})
+_stub("homeassistant.components.binary_sensor").BinarySensorDeviceClass = types.SimpleNamespace(PLUG="plug")
+_stub("homeassistant.components.button").ButtonDeviceClass = types.SimpleNamespace(RESTART="restart")
+_stub("homeassistant.components.number").NumberDeviceClass = types.SimpleNamespace(CURRENT="current")
+_stub("homeassistant.components.number").NumberMode = types.SimpleNamespace(BOX="box")
+sys.modules["homeassistant.const"].UnitOfTime = types.SimpleNamespace(MINUTES="min")
 
 _stub("homeassistant.core", HomeAssistant=object)
 _stub("homeassistant.exceptions", ConfigEntryAuthFailed=type("ConfigEntryAuthFailed", (Exception,), {}))
@@ -133,3 +172,4 @@ const = load("const")
 pairing = load("pairing")
 api = load("api")
 meter = load("meter")
+charger = load("charger")

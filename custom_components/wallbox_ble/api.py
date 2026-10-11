@@ -215,6 +215,8 @@ class WallboxBLEApiConst:
     GET_POWER_BOOST_STATUS = "r_dca"
     GET_POWER_INFUSION = "g_pwi"
     GET_POWER_SHARING = "g_psh"
+    GET_REALTIME = "r_sta"
+    GET_NOTIFICATIONS = "r_not"
     GET_PIN = "read_pin"
     GET_PROXY_MODE = "gpmod"
     GET_SCHEDULE = "r_sch"
@@ -286,6 +288,7 @@ class WallboxBLEApiConst:
         "OCPP_RESERVED",  # 16
         "UPDATING",  # 17
         "QUEUE_BY_ECO_SMART",  # 18
+        "CONNECTED_NO_CURRENT",  # 19 -- car plugged in, no current allotted
     ]
 
 
@@ -602,8 +605,9 @@ class WallboxBLEApiClient:
         # an authentication rejection apart from a wedged or dead link.
         self._last_write_exc = None
         self._auth_help_logged = False
-        # BAPI error object from the most recent response, if it carried one.
+        # BAPI error object / whole frame of the most recent response.
         self.last_error = None
+        self.last_response = None
         # Keys of warnings already emitted, so a second-by-second reconnect loop
         # reports each distinct problem once.
         self._warned = set()
@@ -634,6 +638,9 @@ class WallboxBLEApiClient:
                     # keep the error so they can tell "not supported" (e.g.
                     # code 4 for a meter that is not fitted) from no data.
                     self.last_error = parsed_data.get("error")
+                    # Kept whole for the odd method that answers outside "r"
+                    # (fw_v_ puts its fields at the top level).
+                    self.last_response = parsed_data
                     return parsed_data.get("r")
                 else:
                     data = bytearray()
@@ -799,6 +806,19 @@ class WallboxBLEApiClient:
         """Get data from the API."""
         ok, _ = await self.request(WallboxBLEApiConst.LOCK, int(locked))
         return ok
+
+    async def async_read(self, method):
+        """Send a getter. Returns (ok, result, error, response).
+
+        result is the "r" payload; error the BAPI error object when the
+        charger answered with one; response the whole decoded frame.
+        """
+        self.last_error = None
+        self.last_response = None
+        ok, result = await self.request(method)
+        if not ok:
+            return False, None, None, None
+        return True, result, self.last_error, self.last_response
 
     async def async_get_meter(self):
         """Read the Power Boost / Power Meter accessory (BAPI r_dca).

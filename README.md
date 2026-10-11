@@ -169,48 +169,58 @@ for you and logs the meaning; the common ones are:
 Values of 77 or below are plain HCI errors, not SMP codes.
 
 ## Implemented features
- - charger status
- - lock / unlock
- - charge current
- - start / stop charging (only available while charging/paused)
- - session energy, charging current and power
- - grid and house power from the Power Boost meter (below)
+
+**Controls:** lock, charge current, start/stop charging (while charging or paused),
+auto-lock on/off and delay, Halo LED brightness, reboot charger.
+
+**Charger:** status, car connected, session energy, lifetime charged energy, charging
+current and power, max available current, notifications. Diagnostics: supply voltage,
+total sessions, Power Boost limit, firmware, serial number, grounding, OCPP status
+(off by default).
+
+**Home:** grid and house current and power from the Power Boost meter (below).
+
+Settings and slow counters (auto-lock, Halo, notifications, sessions, Power Boost
+limit) are read every 5 minutes rather than every 10 s, to keep traffic over a
+Bluetooth proxy down; changing a setting re-reads them immediately.
 
 ## Grid meter (Power Boost)
 
 Chargers fitted with Wallbox's **Power Boost** meter report what that meter measures,
-read over BLE with BAPI `r_dca`:
+read over BLE with BAPI `r_dca`. Everything is worked out from the meter's **current**.
+Power Boost only needs current to do its job, and the meter is often wired without a
+voltage reference, in which case its own power, voltage and energy readings are all 0.
 
 | Sensor | Meaning |
 | --- | --- |
-| **Grid power** | Total power at the grid connection, W. Negative while exporting |
-| **House power (excl. charger)** | Grid power minus the charger's own draw |
-| **Grid meter energy** | The meter's lifetime energy counter, kWh |
-| Grid power / current / voltage L1–L3 | Per phase; diagnostic, disabled by default. Phases the meter does not see (L2/L3 on a single-phase supply) stay unavailable |
+| **Grid current** / **Grid power** | Everything through the grid connection |
+| **House current / power (excl. charger)** | Grid minus the charger's own draw |
+| Grid meter energy | The meter's own counter. Off by default: it stays at 0 without a voltage reference |
+
+**Where the voltage comes from.** The charger has no voltage reading either, but while
+charging it reports its own power (`cp`) as well as its current, so voltage = power ÷
+current. That value is kept between charges, and 230 V is used until the first charge.
+It appears as the *Supply voltage* diagnostic sensor, whose `measured` attribute says
+which of the two it is. The same voltage converts the charger, grid and house currents
+into watts, so the figures add up: grid = house + charger.
+
+**What "house" means here.** Power Boost meters are installed at the main connection,
+so they measure the whole supply *including the charger*; the rest of the house is
+grid minus charger. House current is never shown below 0: without generation on the
+connection the house cannot feed the grid, so a slightly negative difference is only
+the two instruments disagreeing.
+
+**Check your installation once.** Start charging while the house is otherwise quiet.
+*Grid current* should rise by about the charging current while *House current* barely
+moves. If grid current doesn't change when charging starts, your meter only sees the
+house circuits; then *Grid power* is your house figure.
 
 On a charger without a meter these sensors stay unavailable. The charger answers
 `r_dca` with BAPI error 4, after which the integration stops asking.
 
-**What "house" means here.** Power Boost meters are installed at the main connection,
-so they measure the whole supply *including the charger*. House power is therefore grid
-minus charger, and the three figures always add up: grid = house + charger. The
-charger's draw is calculated from its per-phase currents and the meter's measured
-voltage.
-
-Two things to keep in mind:
-- **Check your installation once.** Start charging while the house is otherwise quiet.
-  *Grid power* should jump by about the charging power, and *House power* should
-  barely move. If grid power doesn't change when charging starts, your meter only sees
-  the house circuits; in that case use *Grid power* as the house figure and ignore
-  *House power*.
-- **Solar on the same connection.** The meter then sees only the net exchange with the
-  grid, so House power becomes the house's net draw from the grid (it can go negative)
-  rather than its total consumption. Getting real consumption needs the solar
-  inverter's production as well.
-
-For the Energy dashboard, add *Grid meter energy* as grid consumption. For a house-only
-energy total, run *House power* through Home Assistant's **Integral** helper
-(Riemann sum, method *left*).
+For the Energy dashboard, use *Lifetime charged energy* for the charger. For the
+house, run *House power* through Home Assistant's **Integral** helper (Riemann sum,
+method *left*).
 
 ## Requirements
  - Home Assistant with a working Bluetooth integration — either a local adapter

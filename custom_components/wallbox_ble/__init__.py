@@ -11,8 +11,11 @@ from .coordinator import WallboxBLEDataUpdateCoordinator
 from .pairing import async_adapter_for_address, async_unpair
 
 PLATFORMS: list[Platform] = [
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
     Platform.LOCK,
     Platform.NUMBER,
+    Platform.SELECT,
     Platform.SENSOR,
     Platform.SWITCH,
 ]

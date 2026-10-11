@@ -1,22 +1,26 @@
 """The Power Boost / Power Meter accessory, read over BLE with BAPI ``r_dca``.
 
 Chargers with Wallbox's Power Boost (an EM112/EM340-class meter wired at the
-grid connection) report what that meter sees. The field layout, verified
-against the botts7/esp32-wallbox reference gateway:
+grid connection) report what that meter sees. The field layout, per the
+botts7/esp32-wallbox reference gateway:
 
-    p1, p2, p3   active power per phase, W (signed: negative = exporting)
-    v1, v2, v3   voltage per phase, V (0 on phases the meter does not see)
     c1, c2, c3   current per phase, in 0.1 A
+    p1, p2, p3   active power per phase, W
+    v1, v2, v3   voltage per phase, V
     e            lifetime energy, Wh
 
 A charger without the accessory answers ``r_dca`` with BAPI error code 4.
 
+Everything here is worked out from the **current** alone. Power Boost only
+needs current to do its job, and installers often wire the meter's current
+clamp without a voltage reference -- then ``p``, ``v`` and ``e`` are all 0
+and only ``c`` means anything. Current is converted to power with the best
+voltage available (see ``charger.implied_voltage``), the same one used for the
+charger, so the figures add up: grid = house + charger.
+
 Where the meter sits matters for what "house" means. Power Boost meters are
 installed at the main connection, so they measure the whole supply *including
-the charger*. What the rest of the house draws is therefore the grid reading
-minus the charger's own draw -- which is how ``house_power`` is computed. With
-solar on the same connection, the meter only sees the net exchange, so that
-figure becomes the house's net draw from the grid rather than its consumption.
+the charger*; the rest of the house is the grid reading minus the charger.
 
 Kept free of Home Assistant imports so the arithmetic can be unit tested.
 """
@@ -40,79 +44,47 @@ def _number(value):
 
 @dataclass(frozen=True)
 class MeterReading:
-    """One ``r_dca`` response, decoded into SI units."""
+    """One ``r_dca`` response."""
 
-    power: tuple  # W per phase (L1, L2, L3), None where not reported
-    voltage: tuple  # V per phase
-    current: tuple  # A per phase
-    energy_kwh: float | None
+    current: tuple  # A per phase (L1, L2, L3), None where not reported
+    energy_kwh: float | None  # 0 / meaningless without a voltage reference
 
-    def phase_present(self, index: int) -> bool:
-        """Whether the meter sees phase ``index`` (0-based).
+    @property
+    def grid_current(self) -> float:
+        """Total current through the grid connection, A.
 
-        L1 always counts when it reports anything. L2/L3 count only with a
-        non-zero voltage: a single-phase meter reports them as 0, and showing
-        "0 W on L3" for a phase that does not exist would be misleading.
+        A current clamp has no sense of direction without a voltage
+        reference, so this is always positive.
         """
-        if index == 0:
-            return any(
-                v is not None
-                for v in (self.power[0], self.voltage[0], self.current[0])
-            )
-        voltage = self.voltage[index]
-        return voltage is not None and voltage > 0
-
-    @property
-    def grid_power(self) -> float | None:
-        """Total power at the grid connection, W; negative while exporting."""
-        values = [
-            p
-            for i, p in enumerate(self.power)
-            if p is not None and self.phase_present(i)
-        ]
-        return sum(values) if values else None
-
-    @property
-    def mean_voltage(self) -> float | None:
-        """Average voltage over the phases the meter sees, V."""
-        values = [v for v in self.voltage if v is not None and v > 0]
-        return sum(values) / len(values) if values else None
+        return sum(abs(c) for c in self.current if c is not None)
 
 
 def parse_meter(response) -> MeterReading | None:
     """Decode an ``r_dca`` result object, or None if it is not one."""
     if not isinstance(response, dict):
         return None
-
-    def triple(prefix, scale=1.0):
-        out = []
-        for phase in (1, 2, 3):
-            value = _number(response.get(f"{prefix}{phase}"))
-            out.append(None if value is None else value * scale)
-        return tuple(out)
-
-    reading = MeterReading(
-        power=triple("p"),
-        voltage=triple("v"),
-        current=triple("c", CURRENT_SCALE),
-        energy_kwh=(
-            None
-            if (e := _number(response.get("e"))) is None
-            else e / WH_PER_KWH
-        ),
+    current = tuple(
+        None if (c := _number(response.get(f"c{phase}"))) is None else c * CURRENT_SCALE
+        for phase in (1, 2, 3)
     )
-    if not reading.phase_present(0) and reading.energy_kwh is None:
-        # An object with none of the meter's fields is not a meter reading.
+    energy = _number(response.get("e"))
+    if all(c is None for c in current):
+        # Without current there is nothing this integration can use.
         return None
-    return reading
+    return MeterReading(
+        current=current,
+        energy_kwh=None if energy is None else energy / WH_PER_KWH,
+    )
 
 
-def house_power(reading: MeterReading | None, charger_power_w) -> float | None:
-    """What the rest of the house draws from the grid, W.
+def house_current(reading: MeterReading | None, charger_amps) -> float | None:
+    """What the rest of the house draws, A.
 
-    The meter sits at the grid connection, so its reading includes the
-    charger; subtract the charger's own draw to get everything else.
+    The meter sits at the grid connection, so it includes the charger; take
+    the charger's own current off. Never below zero: with no generation on
+    the connection the house cannot feed the grid, so a negative result is
+    only the two instruments disagreeing by a fraction of an amp.
     """
-    if reading is None or reading.grid_power is None or charger_power_w is None:
+    if reading is None or charger_amps is None:
         return None
-    return reading.grid_power - charger_power_w
+    return max(0.0, reading.grid_current - charger_amps)

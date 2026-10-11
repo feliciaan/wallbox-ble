@@ -9,31 +9,60 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 
 ## [0.6.0] - 2026-10-11
 
+Brings over the charger features of the `botts7/esp32-wallbox` gateway that work
+through an ordinary Bluetooth proxy, so the charger no longer needs a dedicated ESP32
+for them. Left out on purpose: solar (Eco-Smart, live solar session data), phase
+switching and dynamic power sharing (single-phase, single-charger installs), and the
+gateway's own health sensors and schedule/reminder logic, which Home Assistant
+automations cover.
+
 ### Added
 
-- **Grid and house power from the Power Boost meter.** The charger's meter accessory
-  is read with BAPI `r_dca` (field layout per the `botts7/esp32-wallbox` reference
-  gateway: `p1..p3` W, `v1..v3` V, `c1..c3` in 0.1 A, `e` lifetime Wh). New
-  sensors: *Grid power*, *House power (excl. charger)*, *Grid meter energy*
-  (`total_increasing`, Energy-dashboard ready), and per-phase power, current and
-  voltage as diagnostics that are disabled by default.
-- House power is grid minus the charger's own draw. Power Boost meters sit at the
-  grid connection, so they include the charger; the reference gateway's "House
-  Power" is the raw grid sum, which overstates the house by the charging power.
-  The README describes a one-off check for installs where the meter only sees the
-  house circuits.
-- The charger's estimated power now uses the meter's measured voltage when there is
-  one (230 V nominal otherwise), so grid = house + charger holds exactly in the UI.
-- `meter.py` holds the decoding and arithmetic with no Home Assistant imports. Tests
-  cover single-phase supplies (stray L2/L3 readings are excluded), export, the
-  no-meter path, and transient errors.
+- **Grid and house current and power from the Power Boost meter** (BAPI `r_dca`),
+  worked out from the meter's current only (`c1..c3`, 0.1 A). Power Boost needs
+  nothing else, and a meter wired without a voltage reference reports 0 for power,
+  voltage and energy. House = grid − charger, since the meter sits at the grid
+  connection; never below 0. The reference gateway's "House Power" is the raw grid
+  sum, which overstates the house by the charging power.
+- **Supply voltage, from the charger.** It has no voltage field, but while charging it
+  reports its power (`r_dat.cp`, kW) and its current, so voltage = power ÷ current
+  (only at ≥ 5 A, and only if 180–260 V). Kept between charges; 230 V until the first.
+  The same voltage converts charger, grid and house current to watts, so
+  grid = house + charger, and charger power equals `cp` while charging.
+- **Car connected** binary sensor, from the status code; while locked (status 6) it
+  uses `r_sta.charger_status` = 19 to tell "locked, car" from "locked, no car".
+- **Lock state from `r_sta.lock_status`**, the charger's actual lock, instead of
+  inferring it from status 6. Falls back to status 6 if `r_sta` is unavailable.
+- **Lifetime charged energy** (`r_sta.grid`, in Wh — not the 10 Wh units of
+  `r_dat.en`) and **max available current**.
+- **Auto-lock** switch and delay (`g_alo` / `s_alo`). The charger stores one value,
+  seconds, 0 = off, and answers with a bare number; switching off and on again
+  restores the previous delay.
+- **Halo LED** brightness select (`g_halocfg` / `s_halocfg`). The write needs the whole
+  object, so standby mode and timeout are kept as last read.
+- **Reboot charger** button (`rebot`).
+- **Notifications** count and latest message (`r_not`).
+- Diagnostics: total sessions (`r_ses.last`; `size` is the log capacity, 99999 on the
+  Max), Power Boost limit (`r_hsh`), firmware (`fw_v_`, answered outside `r`), serial
+  number, grounding (shape and "healthy" code differ by family, so integers are shown
+  as codes), and OCPP status (off by default).
+- Settings and slow counters are read every 5 minutes, identity once per connection,
+  and a write re-reads them at once.
+
+### Fixed
+
+- **Status code 19 ("connected, no current") no longer breaks every poll.** The status
+  list stopped at 18 and the lookup indexed it directly, raising `IndexError`; Power
+  Boost holding current back is exactly when 19 appears. Unknown codes now show as
+  `UNKNOWN_<n>` instead of raising.
+- A poll that returns no data no longer raises on `data.get`.
 
 ### Changed
 
-- BAPI error responses are kept rather than discarded, so a definite "not supported"
-  (error 4) can be told apart from a missed answer. Only error 4 switches meter
-  polling off; anything else keeps polling, and a missed answer keeps the last
-  reading instead of flapping the sensors to unavailable.
+- BAPI error responses are kept rather than discarded, so "not supported" (error 4)
+  is told apart from a missed answer: only error 4 stops meter polling, and a missed
+  answer keeps the last reading instead of flapping sensors to unavailable.
+- Charging power is current × the supply voltage above, rather than × a fixed 230 V.
 
 ## [0.5.0] - 2026-08-31
 

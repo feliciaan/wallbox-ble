@@ -1,160 +1,229 @@
-"""Power Boost meter: decoding r_dca, polling it, and the grid/house sensors."""
+"""Power Boost meter from current only, the coordinator's poll cycle, and sensors."""
 import asyncio
 import types
 
 import pytest
 
-from _loader import load, meter
+from _loader import api, load, meter
 
 coordinator_mod = load("coordinator")
 sensor_mod = load("sensor")
 
-# Field layout per the botts7/esp32-wallbox reference gateway.
-THREE_PHASE = {"v1": 231, "v2": 229, "v3": 230, "p1": 1200, "p2": 800, "p3": 450,
-               "c1": 52, "c2": 35, "c3": 20, "e": 1234567}
-SINGLE_PHASE = {"v1": 240, "v2": 0, "v3": 0, "p1": 4500, "p2": 7, "p3": 0,
-                "c1": 188, "c2": 0, "c3": 0, "e": 50000}
+# A meter wired without a voltage reference: only the current means anything.
+CURRENT_ONLY = {"v1": 0, "v2": 0, "v3": 0, "p1": 0, "p2": 0, "p3": 0,
+                "c1": 220, "c2": 0, "c3": 0, "e": 0}
 
 
 # ---------------------------------------------------------------- decoding
 
-def test_three_phase_reading():
-    r = meter.parse_meter(THREE_PHASE)
-    assert r.grid_power == 2450
-    assert r.current == pytest.approx((5.2, 3.5, 2.0))  # 0.1 A units
-    assert r.energy_kwh == pytest.approx(1234.567)  # Wh -> kWh
-    assert r.mean_voltage == pytest.approx(230)
-    assert all(r.phase_present(i) for i in range(3))
+def test_current_only_meter():
+    r = meter.parse_meter(CURRENT_ONLY)
+    assert r.grid_current == pytest.approx(22.0)  # 0.1 A units
 
 
-def test_single_phase_ignores_phases_without_voltage():
-    r = meter.parse_meter(SINGLE_PHASE)
-    assert r.phase_present(0)
-    assert not r.phase_present(1) and not r.phase_present(2)
-    # A stray reading on a phase with no voltage must not leak into the total.
-    assert r.grid_power == 4500
-    assert r.mean_voltage == 240
+def test_three_phase_current_sums():
+    r = meter.parse_meter({"c1": 100, "c2": 50, "c3": 25})
+    assert r.grid_current == pytest.approx(17.5)
 
 
-def test_export_is_negative():
-    r = meter.parse_meter({**THREE_PHASE, "p1": -3000, "p2": -100, "p3": 0})
-    assert r.grid_power == -3100
-
-
-@pytest.mark.parametrize("response", [None, 4, "x", [], {}, {"foo": 1}])
-def test_non_readings_are_rejected(response):
+@pytest.mark.parametrize("response", [None, 4, "x", [], {}, {"v1": 230, "p1": 900}])
+def test_no_current_is_no_reading(response):
     assert meter.parse_meter(response) is None
 
 
-def test_non_numeric_fields_are_dropped():
-    r = meter.parse_meter({"v1": 230, "p1": True, "c1": "12", "e": 1000})
-    assert r.power[0] is None and r.current[0] is None
-    assert r.energy_kwh == 1.0
+def test_house_current_subtracts_the_charger_and_never_goes_negative():
+    r = meter.parse_meter(CURRENT_ONLY)
+    assert meter.house_current(r, 16.0) == pytest.approx(6.0)
+    # The meter reading 0.2 A under the charger is instrument mismatch, not export.
+    assert meter.house_current(meter.parse_meter({"c1": 158}), 16.0) == 0.0
+    assert meter.house_current(None, 16.0) is None
 
 
-def test_house_power_subtracts_the_charger():
-    r = meter.parse_meter(THREE_PHASE)
-    assert meter.house_power(r, 2000) == 450
-    assert meter.house_power(r, 0) == 2450
-    assert meter.house_power(None, 2000) is None
-    assert meter.house_power(r, None) is None
+# ---------------------------------------------------------------- poll cycle
 
+class FakeCharger:
+    """Answers BAPI reads from a table; counts what was asked."""
 
-# ---------------------------------------------------------------- polling
+    ready = True
+    pairing_auth_failed = False
 
-class FakeApi:
-    def __init__(self, *answers):
-        self.answers = list(answers)
-        self.calls = 0
+    def __init__(self, status, answers=None):
+        self.status = status
+        self.answers = answers or {}
+        self.reads = []
+        self.writes = []
+
+    async def async_get_max_charge_current(self):
+        return True, 32
+
+    async def async_get_data(self):
+        return True, self.status
 
     async def async_get_meter(self):
-        self.calls += 1
-        return self.answers.pop(0)
+        return True, self.answers.get("r_dca", CURRENT_ONLY), None
+
+    async def async_read(self, method):
+        self.reads.append(method)
+        if method not in self.answers:
+            return True, None, {"code": 4}, {"error": {"code": 4}}
+        answer = self.answers[method]
+        response = answer if method == "fw_v_" else {"r": answer}
+        return True, (None if method == "fw_v_" else answer), None, response
+
+    async def request(self, method, parameter=None):
+        self.writes.append((method, parameter))
+        return True, None
 
 
-def make_coordinator(api):
+ANSWERS = {
+    "r_sta": {"lock_status": 1, "max_available_current": 25, "grid": 1234567,
+              "charger_status": 19, "ocpp_status": 1},
+    "g_alo": 120,
+    "g_halocfg": {"bright": 80, "mode": 0, "time_s": 30},
+    "r_not": [{"message": "Grounding fault"}],
+    "r_ses": {"last": 412},
+    "r_hsh": 25,
+    "fw_v_": {"s": "6.11.26", "p": "MAX"},
+    "r_sn_": "1414644",
+    "r_wel": 0,
+}
+
+
+def make(status, answers=ANSWERS):
     c = coordinator_mod.WallboxBLEDataUpdateCoordinator(hass=None)
-    c.wb = api
+    c.wb = FakeCharger(status, dict(answers))
     return c
 
 
-def test_reading_is_stored():
-    c = make_coordinator(FakeApi((True, THREE_PHASE, None)))
-    asyncio.run(c._async_update_meter())
-    assert c.meter_supported is True and c.meter.grid_power == 2450
+def run_poll(c):
+    data = asyncio.run(c._async_update_data())
+    c.data = data  # what DataUpdateCoordinator does with the return value
+    return data
 
 
-def test_not_supported_stops_polling():
-    api = FakeApi((True, None, {"code": 4}))
-    c = make_coordinator(api)
-    asyncio.run(c._async_update_meter())
-    asyncio.run(c._async_update_meter())
-    assert c.meter_supported is False and c.meter is None
-    assert api.calls == 1, "kept polling a charger that has no meter"
+def test_full_poll_while_charging():
+    # Charging 16 A, charger reports 3.76 kW -> 235 V; meter sees 22 A in total.
+    c = make({"st": 1, "L1": 160, "L2": 0, "L3": 0, "cp": 3.76, "cur": 16})
+    run_poll(c)
+
+    assert c.status == "CHARGING" and c.car_connected is True
+    assert c.voltage == pytest.approx(235.0) and c.voltage_measured
+    assert c.charger_power == pytest.approx(3760)  # = cp, via the same voltage
+    assert c.grid_power == pytest.approx(22 * 235)
+    assert c.house_current == pytest.approx(6.0)
+    assert c.house_power == pytest.approx(6 * 235)
+    # The three figures shown add up.
+    assert c.grid_power == pytest.approx(c.house_power + c.charger_power)
+
+    assert c.locked is True  # from r_sta.lock_status, not st == 6
+    assert c.autolock_seconds == 120
+    assert c.notification_count == 1 and c.latest_notification == "Grounding fault"
+    assert c.session_count == 412 and c.power_boost_limit == 25
+    assert (c.firmware, c.serial_number, c.grounding) == ("6.11.26", "1414644", "Code 0")
 
 
-def test_other_errors_keep_polling():
-    api = FakeApi((True, None, {"code": 2}), (True, THREE_PHASE, None))
-    c = make_coordinator(api)
-    asyncio.run(c._async_update_meter())
-    assert c.meter_supported is None
-    asyncio.run(c._async_update_meter())
-    assert c.meter_supported is True and api.calls == 2
+def test_voltage_is_kept_between_charges():
+    c = make({"st": 1, "L1": 160, "cp": 3.76})
+    run_poll(c)
+    c.wb.status = {"st": 0, "L1": 0, "cp": 0}
+    run_poll(c)
+    assert c.voltage == pytest.approx(235.0)
+    assert c.charger_power == 0
+    assert c.grid_power == pytest.approx(22 * 235)  # whole grid draw is house now
 
 
-def test_missed_answer_keeps_the_last_reading():
-    c = make_coordinator(FakeApi((True, THREE_PHASE, None), (False, None, None)))
-    asyncio.run(c._async_update_meter())
-    asyncio.run(c._async_update_meter())
-    assert c.meter.grid_power == 2450
+def test_nominal_voltage_until_the_first_charge():
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    assert c.voltage == 230.0 and not c.voltage_measured
+
+
+def test_status_19_no_longer_crashes():
+    c = make({"st": 19, "L1": 0})
+    run_poll(c)
+    assert c.status == "CONNECTED_NO_CURRENT" and c.available
+
+
+def test_unknown_status_code_does_not_crash():
+    c = make({"st": 42, "L1": 0})
+    run_poll(c)
+    assert c.status == "UNKNOWN_42" and c.available
+
+
+def test_slow_poll_cadence():
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    first = list(c.wb.reads)
+    assert {"g_alo", "g_halocfg", "r_not", "r_ses", "r_hsh", "fw_v_", "r_sn_", "r_wel"} <= set(first)
+    c.wb.reads.clear()
+    run_poll(c)
+    assert c.wb.reads == ["r_sta"], "settings re-read on every 10 s poll"
+
+
+def test_identity_retried_until_something_answers():
+    c = make({"st": 0, "L1": 0}, answers={})
+    run_poll(c)
+    assert c._info_read is True  # an error answer is still an answer
+
+
+def test_lock_falls_back_to_status_without_realtime():
+    answers = {k: v for k, v in ANSWERS.items() if k != "r_sta"}
+    c = make({"st": 6, "L1": 0}, answers)
+    run_poll(c)
+    assert c.locked is True
+
+
+def test_autolock_and_halo_writes():
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    asyncio.run(c.async_set_autolock(0))
+    asyncio.run(c.async_set_halo("Low"))
+    assert ("s_alo", 0) in c.wb.writes
+    assert ("s_halocfg", {"bright": 20, "mode": 0, "time_s": 30}) in c.wb.writes
 
 
 # ---------------------------------------------------------------- sensors
-
-def coordinator_with(data, reading):
-    return types.SimpleNamespace(data=data, meter=reading, available=True)
-
 
 def describe(key):
     return next(d for d in sensor_mod.ENTITY_DESCRIPTIONS if d.key == key)
 
 
-def value(key, coordinator):
-    return describe(key).value_fn(coordinator)
+def value(key, c):
+    return describe(key).value_fn(c)
 
 
-def available(key, coordinator):
+def available(key, c):
     check = describe(key).available_fn
-    return check is None or check(coordinator)
+    return check is None or check(c)
 
 
-def test_house_power_uses_the_measured_voltage():
-    # Charging 16 A on one phase while the meter reads 240 V and 4500 W.
-    c = coordinator_with({"L1": 160, "L2": 0, "L3": 0}, meter.parse_meter(SINGLE_PHASE))
-    assert value("power", c) == 3840  # 16 A x 240 V, not x 230 V
-    assert value("grid_power", c) == 4500
-    assert value("house_power", c) == 660
-    # The figures shown must add up: grid = house + charger.
-    assert value("house_power", c) + value("power", c) == value("grid_power", c)
+def test_sensor_values_from_a_poll():
+    c = make({"st": 1, "L1": 160, "cp": 3.76, "en": 512})
+    run_poll(c)
+    assert value("power", c) == 3760
+    assert value("grid_current", c) == 22.0
+    assert value("grid_power", c) == 5170
+    assert value("house_current", c) == 6.0
+    assert value("house_power", c) == 1410
+    assert value("supply_voltage", c) == 235.0
+    assert value("lifetime_energy", c) == 1234.57  # r_sta.grid is Wh
+    assert value("max_available_current", c) == 25
+    assert value("ocpp_status", c) == "Not configured"
+    assert value("latest_notification", c) == "Grounding fault"
 
 
-def test_without_a_meter():
-    c = coordinator_with({"L1": 160}, None)
-    assert value("power", c) == 3680  # falls back to 230 V nominal
-    for key in ("grid_power", "house_power", "grid_energy", "grid_power_l1"):
+def test_meter_sensors_unavailable_without_a_meter():
+    c = make({"st": 0, "L1": 160})
+    c.meter = None
+    for key in ("grid_current", "grid_power", "house_current", "house_power", "grid_energy"):
         assert not available(key, c)
         assert value(key, c) is None
 
 
-def test_per_phase_sensors_follow_the_supply():
-    c = coordinator_with({}, meter.parse_meter(SINGLE_PHASE))
-    assert available("grid_power_l1", c) and value("grid_power_l1", c) == 4500
-    assert available("grid_current_l1", c) and value("grid_current_l1", c) == 18.8
-    assert not available("grid_power_l3", c)
-    assert describe("grid_power_l3").entity_registry_enabled_default is False
+def test_meter_energy_is_off_by_default():
+    # Meaningless on a meter without a voltage reference.
+    assert describe("grid_energy").entity_registry_enabled_default is False
 
 
-def test_energy_sensor_is_dashboard_ready():
-    d = describe("grid_energy")
-    assert d.state_class == "total_increasing" and d.native_unit_of_measurement == "kWh"
-    assert value("grid_energy", coordinator_with({}, meter.parse_meter(THREE_PHASE))) == 1234.57
+def test_status_code_list_covers_19():
+    assert api.WallboxBLEApiConst.STATUS_CODES[19] == "CONNECTED_NO_CURRENT"
