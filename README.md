@@ -252,3 +252,20 @@ Assistant's **Integral** helper (Riemann sum, method *left*).
    removes the bond again.
  - The charger accepts a single BLE connection at a time; if the Wallbox phone app
    is connected it may briefly block Home Assistant (and vice-versa).
+
+## Development
+
+```sh
+pip install -r requirements_test.txt
+python -m pytest tests -n auto --timeout=60
+```
+
+No Home Assistant install is needed. `tests/test_simulation.py` runs the real
+connection loop, request path and coordinator against a simulated charger, across
+every combination of Bluetooth path (local adapter / ESPHome proxy), radio profile
+(Pulsar Max / Plus / original Pulsar), passcode, Power Boost meter and link speed,
+plus dropped links, ignored commands, start-up notification failures, a wrong
+passcode, a proxy without the passcode, writes during polling and shutdown. The
+simulated charger checks every frame byte for byte and stops answering on a corrupt
+one, as the real one does.
+

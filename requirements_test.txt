@@ -1,0 +1,7 @@
+# Test dependencies -- Home Assistant itself is not needed (tests/_loader.py
+# stands in for the parts the integration touches).
+pytest
+pytest-timeout
+pytest-xdist
+dbus-fast
+voluptuous

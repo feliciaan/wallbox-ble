@@ -27,6 +27,8 @@ from .pairing import (
 # blocked forever. The coordinator polls every 10 s, so 60 s ~= 6 missed reads.
 HEALTH_CHECK_INTERVAL = 15
 STALE_RECONNECT_S = 60
+# Pause before trying to connect again after a failed attempt.
+RECONNECT_DELAY_S = 1.0
 
 # Per-write BLE timeout. A BlueZ/dbus write_gatt_char can wedge in an
 # UNCANCELLABLE state: the ATT write already reached the charger (the command
@@ -573,7 +575,7 @@ class WallboxBLEApiClient:
                             break
             except Exception as e:
                 LOGGER.debug(f"Error: {type(e)}, {e}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(RECONNECT_DELAY_S)
             finally:
                 self._session_ready = False
                 if self.client is not None:

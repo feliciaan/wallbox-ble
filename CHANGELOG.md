@@ -110,6 +110,17 @@ automations cover.
   `UNKNOWN_<n>` instead of raising.
 - A poll that returns no data no longer raises on `data.get`.
 
+### Tests
+
+- `tests/test_simulation.py`: end-to-end runs of the real connection loop, request
+  path and coordinator against a simulated charger. 72 combinations of Bluetooth path
+  × radio profile × passcode × meter × link speed, plus 9 failure scenarios. The
+  simulated charger validates every frame and stops answering on a corrupt one, as
+  the real one does. Run against the two commits that broke in the field, it
+  reproduces both failures: overlapping requests losing their replies (`093d970`),
+  and a slow proxy never getting healthy (`50d7cd5`). 235 tests in all, on Python
+  3.11 and 3.13; `requirements_test.txt` lists what they need.
+
 ### Changed
 
 - BAPI error responses are kept rather than discarded, so "not supported" (error 4)
