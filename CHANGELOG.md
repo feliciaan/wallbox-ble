@@ -54,6 +54,19 @@ automations cover.
 
 ### Fixed
 
+- **Long replies through a Bluetooth proxy are no longer cut off.** The reply timeout
+  was a fixed 2 s for the whole reply. The Pulsar Max keeps a 23-byte ATT MTU, so a
+  status reply arrives as a dozen or more notifications, each relayed over Wi-Fi by
+  the proxy; a field log measured ~1.8 s for a 2-byte reply alone. So every status
+  read timed out and every entity stayed unavailable. This only surfaced once the
+  timeout actually worked: before the cancellation fix below, the bare `except:`
+  swallowed it, and slow replies still got through. Now: up to 5 s for the first
+  piece, then up to 3 s between pieces while the reply keeps arriving, capped at
+  20 s. A silent charger still fails quickly.
+- **The session login (`suser`) is retried.** It ran once per connection, straight
+  after connecting. If that one status read was slow, the login was skipped for the
+  whole session, and the charger needs it before it accepts control commands. The
+  coordinator now completes it on its first successful status read.
 - **One charger request in flight at a time, and no polling until the connection is
   set up.** A command goes out as several 20-byte writes with awaits in between, and
   nothing stopped two requests overlapping, so their pieces interleaved on the

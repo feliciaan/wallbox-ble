@@ -39,8 +39,16 @@ STALE_RECONNECT_S = 60
 # so control always returns to the caller after WRITE_TIMEOUT_S.
 WRITE_TIMEOUT_S = 2
 
-# How long request() waits for the charger's reply before giving up.
-RESPONSE_TIMEOUT_S = 2
+# How long request() waits for the charger's reply. Replies arrive as many
+# small notifications -- the Pulsar Max keeps a 23-byte ATT MTU, so a status
+# reply is a dozen or more pieces -- and through a Bluetooth proxy each piece
+# is relayed over Wi-Fi, so a fixed total budget cuts long replies off
+# (measured: ~1.8 s for a 2-byte reply through an ESPHome proxy). Instead,
+# wait for the first piece, then keep waiting while pieces keep coming,
+# within an overall cap. A charger that never answers still fails fast.
+RESPONSE_START_TIMEOUT_S = 5  # until the first piece of the reply
+RESPONSE_GAP_TIMEOUT_S = 3  # between pieces once the reply has started
+RESPONSE_TOTAL_TIMEOUT_S = 20  # whole reply, however steadily it arrives
 
 # ATT/GATT status codes meaning "this link is not paired well enough for that
 # operation". BlueZ reports the ATT error and the ESPHome proxy reports
@@ -439,14 +447,29 @@ class WallboxBLEApiClient:
         """
         try:
             ok, data = await self.async_get_data()
-            if ok and isinstance(data, dict) and data.get("usid") is not None:
-                usid = data["usid"]
-                ok2, _ = await self.request(WallboxBLEApiConst.SET_USER, usid)
-                LOGGER.debug(f"Authenticated session with usid={usid} ok={ok2}")
+            if ok and isinstance(data, dict):
+                await self.async_login(data)
             else:
-                LOGGER.debug("No usid in status; skipping session auth")
+                # The coordinator retries from its first successful status
+                # read (see async_login), so one slow reply here does not
+                # leave the whole session without the login.
+                LOGGER.debug("No status yet; session login deferred to the next poll")
         except Exception as e:
             LOGGER.debug(f"Authenticate failed: {e}")
+
+    async def async_login(self, status) -> bool:
+        """Send suser with the charger's own user id, once per connection.
+
+        Safe to call on every status read: it does nothing once logged in, or
+        when the status carries no usid (firmware without session login).
+        """
+        if self.logged_in or not isinstance(status, dict) or status.get("usid") is None:
+            return self.logged_in
+        usid = status["usid"]
+        ok, _ = await self.request(WallboxBLEApiConst.SET_USER, usid)
+        self.logged_in = ok
+        LOGGER.debug(f"Session login with usid={usid} ok={ok}")
+        return ok
 
     async def run_ble_client(self):
         async def callback_handler(sender, data):
@@ -461,6 +484,7 @@ class WallboxBLEApiClient:
         while True:
             LOGGER.debug("Connecting...")
             self._session_ready = False
+            self.logged_in = False
             # Reset any pending reconnect signal (from a prior disconnect or an
             # abandoned write) BEFORE we connect, so the fresh link is not torn
             # down immediately.
@@ -623,6 +647,8 @@ class WallboxBLEApiClient:
         # the connect sequence has finished (see ready).
         self._request_lock = asyncio.Lock()
         self._session_ready = False
+        # suser login done on the current connection (see async_login).
+        self.logged_in = False
         # Set once BlueZ turns out not to know this charger (it is served by a
         # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
         # lookup on every later reconnect.
@@ -642,7 +668,8 @@ class WallboxBLEApiClient:
             # response timeout -- asyncio delivers a timeout as a cancellation
             # -- so an unanswered request hung polling for good, and (b) left
             # Home Assistant unable to cancel the refresh task at shutdown.
-            data += await self.rx_queue.get()
+            timeout = RESPONSE_GAP_TIMEOUT_S if data else RESPONSE_START_TIMEOUT_S
+            data += await asyncio.wait_for(self.rx_queue.get(), timeout)
             try:
                 parsed_data = json.loads(data)
             except ValueError:
@@ -840,13 +867,13 @@ class WallboxBLEApiClient:
 
         try:
             response = await asyncio.wait_for(
-                self.get_parsed_response(request_id), RESPONSE_TIMEOUT_S
+                self.get_parsed_response(request_id), RESPONSE_TOTAL_TIMEOUT_S
             )
             LOGGER.debug("Got response!")
             self.last_success = asyncio.get_running_loop().time()
             return True, response
         except asyncio.TimeoutError:
-            LOGGER.debug("No response to %s within %ss", method, RESPONSE_TIMEOUT_S)
+            LOGGER.debug("No (complete) response to %s", method)
             self.last_failure = "timeout"
             return False, None
 

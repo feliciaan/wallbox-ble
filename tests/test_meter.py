@@ -94,6 +94,10 @@ class FakeCharger:
     async def async_get_data(self):
         return True, self.status
 
+    async def async_login(self, status):
+        self.logins = getattr(self, "logins", 0) + 1
+        return True
+
     async def async_read(self, method):
         self.reads.append(method)
         self.last_failure = None

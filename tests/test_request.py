@@ -34,7 +34,9 @@ class SilentLink:
 
 
 def make_client(monkeypatch, link):
-    monkeypatch.setattr(api, "RESPONSE_TIMEOUT_S", 0.2, raising=False)
+    monkeypatch.setattr(api, "RESPONSE_START_TIMEOUT_S", 0.2, raising=False)
+    monkeypatch.setattr(api, "RESPONSE_GAP_TIMEOUT_S", 0.1, raising=False)
+    monkeypatch.setattr(api, "RESPONSE_TOTAL_TIMEOUT_S", 2, raising=False)
     client = api.WallboxBLEApiClient()
     client.client = link
     client.service_uuid = client.rx_uuid = "uuid"
@@ -116,7 +118,7 @@ def test_timeout_is_reported_as_such(monkeypatch, caplog):
 
     caplog.set_level("DEBUG")
     assert asyncio.run(scenario()) == "timeout"
-    assert any("No response to r_hsh" in r.getMessage() for r in caplog.records)
+    assert any("response to r_hsh" in r.getMessage() for r in caplog.records)
 
 
 def test_success_clears_the_failure(monkeypatch):
@@ -192,3 +194,72 @@ def test_not_ready_until_setup_finishes(monkeypatch):
     assert client.ready
     client.client.is_connected = False
     assert not client.ready
+
+
+# ---------------------------------------------------------------- slow replies
+
+async def _trickle(client, request_id, pieces, delay):
+    """Deliver a reply in `pieces` notifications, `delay` seconds apart."""
+    frame = json.dumps({"id": request_id, "r": {"st": 1, "pad": "x" * 200}}).encode()
+    step = -(-len(frame) // pieces)
+    for i in range(0, len(frame), step):
+        await asyncio.sleep(delay)
+        client.rx_queue.put_nowait(frame[i:i + step])
+
+
+def test_long_slow_reply_is_not_cut_off(monkeypatch):
+    """A status reply trickling in through a proxy, slower overall than the
+    first-piece timeout, but never pausing longer than the gap timeout."""
+    async def scenario():
+        link = SilentLink()
+        client = make_client(monkeypatch, link)
+        task = asyncio.create_task(client.request("r_dat"))
+        await asyncio.sleep(0.01)
+        # 12 pieces x 0.05 s = 0.6 s in all: 3x the 0.2 s first-piece timeout.
+        await _trickle(client, _sent_id(link), pieces=12, delay=0.05)
+        return await task
+
+    ok, result = asyncio.run(scenario())
+    assert ok and result["st"] == 1
+
+
+def test_reply_that_stalls_midway_times_out(monkeypatch):
+    async def scenario():
+        link = SilentLink()
+        client = make_client(monkeypatch, link)
+        task = asyncio.create_task(client.request("r_dat"))
+        await asyncio.sleep(0.01)
+        frame = json.dumps({"id": _sent_id(link), "r": 1}).encode()
+        client.rx_queue.put_nowait(frame[:5])  # starts, then nothing more
+        return await asyncio.wait_for(task, 3)
+
+    assert asyncio.run(scenario()) == (False, None)
+
+
+# ---------------------------------------------------------------- session login
+
+def test_login_happens_once_per_connection(monkeypatch):
+    async def scenario():
+        link = AnsweringLink()
+        client = make_client(monkeypatch, link)
+        link.client = client
+        client.logged_in = False
+        await client.async_login({"usid": 42})
+        await client.async_login({"usid": 42})  # already logged in: no traffic
+        await client.async_login({"st": 0})  # no usid: nothing to do
+        return client, link
+
+    client, link = asyncio.run(scenario())
+    sent = _frames(link.writes)
+    assert [(f["met"], f["par"]) for f in sent] == [("suser", 42)]
+    assert client.logged_in
+
+
+def test_login_retried_after_a_failed_attempt(monkeypatch):
+    async def scenario():
+        client = make_client(monkeypatch, SilentLink())  # nobody answers
+        client.logged_in = False
+        first = await client.async_login({"usid": 42})
+        return first, client.logged_in
+
+    assert asyncio.run(scenario()) == (False, False)  # next poll will try again

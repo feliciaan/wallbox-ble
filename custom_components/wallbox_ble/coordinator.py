@@ -149,6 +149,8 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self.charge_current = data.get("cur", 6)
             self.status = self._status_name(self.status_code)
             self.available = True
+            # Completes the session login if setup's own attempt missed it.
+            await self.wb.async_login(data)
             await self._async_update_realtime()
             await self._async_update_meter()
             self._update_voltage(data)
