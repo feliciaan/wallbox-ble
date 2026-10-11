@@ -53,6 +53,11 @@ automations cover.
 
 ### Fixed
 
+- **One lost status reply no longer makes the whole device unavailable.** Through a
+  proxy, a reply occasionally never arrives; every entity used to go unavailable until
+  the next poll succeeded, which could take 30 s when that poll also did the slow
+  settings read. The last values are now kept, and the device only goes unavailable
+  after three status polls in a row go unanswered (or the link stays down that long).
 - **A slow write no longer forces a reconnect.** Through an ESPHome proxy, every
   20-byte write waits for an ATT write response relayed over Wi-Fi, and the 2 s write
   timeout was hit routinely. Each hit forced a reconnect, after which the charger

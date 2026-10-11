@@ -344,3 +344,73 @@ def test_status_read_is_never_dropped():
     for _ in range(5):
         run_poll(c)
     assert c.available and "r_dat" not in c._skipped
+
+
+# ---------------------------------------------------------------- missed status
+
+def _drop_status(c, polls):
+    """Make the next `polls` status reads go unanswered."""
+    answer = c.wb.async_get_data
+    left = {"n": polls}
+
+    async def flaky():
+        if left["n"]:
+            left["n"] -= 1
+            return False, None
+        return await answer()
+
+    c.wb.async_get_data = flaky
+
+
+def test_one_missed_status_keeps_the_device_and_its_values():
+    # The field log: one r_dat reply never arrived and every entity went
+    # unavailable for 30 s.
+    c = make({"st": 2, "L1": 160, "cp": 3.68, "en": 512})
+    run_poll(c)
+    before = dict(c.data)
+    _drop_status(c, coordinator_mod.MAX_STATUS_MISSES - 1)
+    for _ in range(coordinator_mod.MAX_STATUS_MISSES - 1):
+        run_poll(c)
+        assert c.available
+        assert c.data == before, "kept values must survive a missed reply"
+    run_poll(c)
+    assert c.available and c._status_misses == 0
+
+
+def test_status_silent_for_long_makes_the_device_unavailable():
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    _drop_status(c, coordinator_mod.MAX_STATUS_MISSES)
+    for _ in range(coordinator_mod.MAX_STATUS_MISSES):
+        run_poll(c)
+    assert not c.available
+    run_poll(c)
+    assert c.available
+
+
+def test_misses_must_be_consecutive():
+    c = make({"st": 0, "L1": 0})
+    run_poll(c)
+    for _ in range(4):
+        _drop_status(c, coordinator_mod.MAX_STATUS_MISSES - 1)
+        for _ in range(coordinator_mod.MAX_STATUS_MISSES):
+            run_poll(c)
+        assert c.available
+
+
+def test_reconnecting_link_counts_as_a_miss():
+    c = make({"st": 0, "L1": 0, "en": 7})
+    run_poll(c)
+    c.wb.ready = False
+    run_poll(c)
+    assert c.available and c.data["en"] == 7, "a short reconnect must not blank the data"
+    for _ in range(coordinator_mod.MAX_STATUS_MISSES):
+        run_poll(c)
+    assert not c.available
+
+
+def test_never_answered_stays_unavailable():
+    c = make({"st": 0, "L1": 0})
+    _drop_status(c, 1)
+    run_poll(c)
+    assert not c.available and c.data is None

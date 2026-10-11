@@ -33,6 +33,12 @@ SLOW_POLL_S = 300
 # the full response timeout on every poll otherwise.
 MAX_UNANSWERED = 3
 
+# Polls in a row without a status reply before the entities go unavailable.
+# Through a Bluetooth proxy one reply in a while simply never arrives; that
+# alone should not blank the whole device until the next poll (which may be a
+# slow one) succeeds. The last values are kept meanwhile.
+MAX_STATUS_MISSES = 3
+
 
 class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
@@ -57,6 +63,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self.status = ""
         self.status_code = 0
         self.available = False
+        self._status_misses = 0
         self._last_success_mono = None
         self._reload_scheduled = False
         # Power Boost meter: the latest decoded reading, and whether the
@@ -131,8 +138,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             )
 
         if not self.wb.ready:
-            self._check_self_heal()
-            return {}
+            return self._status_missed()
 
         if self.max_charge_current == 0:
             ok, data = await self.wb.async_get_max_charge_current()
@@ -149,6 +155,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self.charge_current = data.get("cur", 6)
             self.status = self._status_name(self.status_code)
             self.available = True
+            self._status_misses = 0
             # Completes the session login if setup's own attempt missed it.
             await self.wb.async_login(data)
             await self._async_update_realtime()
@@ -156,9 +163,15 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self._update_voltage(data)
             await self._async_update_slow()
             return data
-        else:
+        return self._status_missed()
+
+    def _status_missed(self):
+        """A poll without a status reply: keep the last values for a while."""
+        self._status_misses += 1
+        if self._status_misses >= MAX_STATUS_MISSES:
             self.available = False
-            self._check_self_heal()
+        self._check_self_heal()
+        return self.data
 
     @staticmethod
     def _status_name(code):

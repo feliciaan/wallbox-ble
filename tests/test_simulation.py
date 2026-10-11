@@ -687,6 +687,7 @@ def test_field_link(monkeypatch):
     )
     charger.field = True
     outcomes = []
+    availability = []
 
     async def body(run):
         original = run.c.wb.request
@@ -703,11 +704,17 @@ def test_field_link(monkeypatch):
         run.c.wb.request = recording
         for _ in range(24):
             await run.poll()
+            availability.append(run.c.available)
             await asyncio.sleep(scaled(1))
         return run
 
     run = run_scenario(monkeypatch, charger, body=body)
 
+    # Once up, a lost status reply here and there must not blank the device.
+    assert True in availability
+    first_up = availability.index(True)
+    assert all(availability[first_up:]), (
+        f"went unavailable after a single fault: {availability}")
     assert len(charger.links) == 1, (
         f"reconnected {len(charger.links) - 1}x -- a slow write must not force a reconnect")
     assert charger.garbled == 0
