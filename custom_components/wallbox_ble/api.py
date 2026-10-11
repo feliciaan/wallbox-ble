@@ -602,6 +602,8 @@ class WallboxBLEApiClient:
         # an authentication rejection apart from a wedged or dead link.
         self._last_write_exc = None
         self._auth_help_logged = False
+        # BAPI error object from the most recent response, if it carried one.
+        self.last_error = None
         # Keys of warnings already emitted, so a second-by-second reconnect loop
         # reports each distinct problem once.
         self._warned = set()
@@ -628,6 +630,10 @@ class WallboxBLEApiClient:
                 parsed_data = json.loads(data)
                 LOGGER.debug(f"Got {parsed_data=}")
                 if parsed_data["id"] == request_id:
+                    # A BAPI error has no "r", so callers would just see None;
+                    # keep the error so they can tell "not supported" (e.g.
+                    # code 4 for a meter that is not fitted) from no data.
+                    self.last_error = parsed_data.get("error")
                     return parsed_data.get("r")
                 else:
                     data = bytearray()
@@ -793,6 +799,16 @@ class WallboxBLEApiClient:
         """Get data from the API."""
         ok, _ = await self.request(WallboxBLEApiConst.LOCK, int(locked))
         return ok
+
+    async def async_get_meter(self):
+        """Read the Power Boost / Power Meter accessory (BAPI r_dca).
+
+        Returns (ok, result, error): result is the raw r{} object, and error
+        the BAPI error object when the charger answered with one instead.
+        """
+        self.last_error = None
+        ok, data = await self.request(WallboxBLEApiConst.GET_POWER_BOOST_STATUS)
+        return ok, data, (self.last_error if ok else None)
 
     async def async_get_max_charge_current(self):
         """Get data from the API."""

@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredrik/wallbox-ble).
 
+## [0.6.0] - 2026-10-11
+
+### Added
+
+- **Grid and house power from the Power Boost meter.** The charger's meter accessory
+  is read with BAPI `r_dca` (field layout per the `botts7/esp32-wallbox` reference
+  gateway: `p1..p3` W, `v1..v3` V, `c1..c3` in 0.1 A, `e` lifetime Wh). New
+  sensors: *Grid power*, *House power (excl. charger)*, *Grid meter energy*
+  (`total_increasing`, Energy-dashboard ready), and per-phase power, current and
+  voltage as diagnostics that are disabled by default.
+- House power is grid minus the charger's own draw. Power Boost meters sit at the
+  grid connection, so they include the charger; the reference gateway's "House
+  Power" is the raw grid sum, which overstates the house by the charging power.
+  The README describes a one-off check for installs where the meter only sees the
+  house circuits.
+- The charger's estimated power now uses the meter's measured voltage when there is
+  one (230 V nominal otherwise), so grid = house + charger holds exactly in the UI.
+- `meter.py` holds the decoding and arithmetic with no Home Assistant imports. Tests
+  cover single-phase supplies (stray L2/L3 readings are excluded), export, the
+  no-meter path, and transient errors.
+
+### Changed
+
+- BAPI error responses are kept rather than discarded, so a definite "not supported"
+  (error 4) can be told apart from a missed answer. Only error 4 switches meter
+  polling off; anything else keeps polling, and a missed answer keeps the last
+  reading instead of flapping the sensors to unavailable.
+
 ## [0.5.0] - 2026-08-31
 
 ### Added

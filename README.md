@@ -173,6 +173,44 @@ Values of 77 or below are plain HCI errors, not SMP codes.
  - lock / unlock
  - charge current
  - start / stop charging (only available while charging/paused)
+ - session energy, charging current and power
+ - grid and house power from the Power Boost meter (below)
+
+## Grid meter (Power Boost)
+
+Chargers fitted with Wallbox's **Power Boost** meter report what that meter measures,
+read over BLE with BAPI `r_dca`:
+
+| Sensor | Meaning |
+| --- | --- |
+| **Grid power** | Total power at the grid connection, W. Negative while exporting |
+| **House power (excl. charger)** | Grid power minus the charger's own draw |
+| **Grid meter energy** | The meter's lifetime energy counter, kWh |
+| Grid power / current / voltage L1–L3 | Per phase; diagnostic, disabled by default. Phases the meter does not see (L2/L3 on a single-phase supply) stay unavailable |
+
+On a charger without a meter these sensors stay unavailable. The charger answers
+`r_dca` with BAPI error 4, after which the integration stops asking.
+
+**What "house" means here.** Power Boost meters are installed at the main connection,
+so they measure the whole supply *including the charger*. House power is therefore grid
+minus charger, and the three figures always add up: grid = house + charger. The
+charger's draw is calculated from its per-phase currents and the meter's measured
+voltage.
+
+Two things to keep in mind:
+- **Check your installation once.** Start charging while the house is otherwise quiet.
+  *Grid power* should jump by about the charging power, and *House power* should
+  barely move. If grid power doesn't change when charging starts, your meter only sees
+  the house circuits; in that case use *Grid power* as the house figure and ignore
+  *House power*.
+- **Solar on the same connection.** The meter then sees only the net exchange with the
+  grid, so House power becomes the house's net draw from the grid (it can go negative)
+  rather than its total consumption. Getting real consumption needs the solar
+  inverter's production as well.
+
+For the Energy dashboard, add *Grid meter energy* as grid consumption. For a house-only
+energy total, run *House power* through Home Assistant's **Integral** helper
+(Riemann sum, method *left*).
 
 ## Requirements
  - Home Assistant with a working Bluetooth integration — either a local adapter

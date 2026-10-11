@@ -14,6 +14,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 
 from .api import WallboxBLEApiClient, WallboxBLEApiConst
 from .const import DOMAIN, LOGGER
+from .meter import ERROR_NOT_SUPPORTED, parse_meter
 
 # Variant B safety net: if the BLE link stays dead even after the client's own
 # reconnect attempts (variant A in api.py), reload the whole config entry once.
@@ -46,6 +47,10 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self.available = False
         self._last_success_mono = None
         self._reload_scheduled = False
+        # Power Boost meter: the latest decoded reading, and whether the
+        # charger has one at all (None until it has answered once).
+        self.meter = None
+        self.meter_supported = None
 
     @classmethod
     async def create(cls, hass, address, pin=None):
@@ -109,10 +114,37 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self.charge_current = data.get("cur", 6)
             self.status = WallboxBLEApiConst.STATUS_CODES[self.status_code]
             self.available = True
+            await self._async_update_meter()
             return data
         else:
             self.available = False
             self._check_self_heal()
+
+    async def _async_update_meter(self):
+        """Poll the grid meter, unless the charger has said it has none."""
+        if self.meter_supported is False:
+            return
+        ok, result, error = await self.wb.async_get_meter()
+        if not ok:
+            # No answer this time; keep the last reading rather than flapping
+            # the meter sensors to unavailable on one dropped frame.
+            return
+        if isinstance(error, dict) and error.get("code") == ERROR_NOT_SUPPORTED:
+            # Only a definite "not supported" switches polling off, so a
+            # transient error does not lose the meter until the next reload.
+            LOGGER.info(
+                "Charger reports no Power Boost meter (r_dca error %s); "
+                "grid and house power sensors will stay unavailable",
+                ERROR_NOT_SUPPORTED,
+            )
+            self.meter_supported = False
+            self.meter = None
+            return
+        reading = parse_meter(result)
+        LOGGER.debug("Meter (r_dca): raw=%s decoded=%s", result, reading)
+        if reading is not None:
+            self.meter_supported = True
+            self.meter = reading
 
     async def async_set_parameter(self, parameter, value):
         ok, _ = await self.wb.request(parameter, value)
