@@ -50,6 +50,31 @@ class BleakError(Exception):
     pass
 
 
+# Link timings through an ESPHome proxy, in real seconds, from a field log.
+WRITE_S = 0.4  # each 20-byte write until its ATT response is relayed back
+SLOW_WRITE_S = 4.0  # an occasional slow one: over the old 2 s write timeout
+REPLY_START_S = 2.0  # until the first piece of a reply
+REPLY_GAP_S = 0.15  # between pieces
+LATE_START_S = 10.0  # a reply that starts after the first-piece timeout
+STALL_S = 4.5  # a mid-reply pause longer than the between-pieces timeout
+
+FIELD_ANSWERS = {
+    "r_dat": {"L1": 0, "L2": 0, "L3": 0, "cp": 0.0, "cur": 32, "den": 0, "en": 0,
+              "gen": 0, "grid": 0, "mid": 1, "ocpp": 1, "ps": 0, "s": 0, "st": 6,
+              "usid": 1},
+    "r_sta": {"charger_status": 6, "error_code": 0, "external_meter_status": 2,
+              "lock_status": 1, "max_available_current": 32, "max_charging_current": 32,
+              "mid_status": 1, "ocpp_status": 1, "phases_connection": 0,
+              "power_sharing_status": 0},  # no "grid" on this firmware
+    "r_dca": {"c1": 18, "c2": 0, "c3": 0, "e": 800, "p1": 351, "p2": 0, "p3": 0,
+              "v1": 230, "v2": 0, "v3": 0},
+    "fw_v_": {"c": "ATLAS", "db": 125, "fw": 20202, "p": "prj20-pulsar-max-pro",
+              "r": 20202, "s": "6.13.6"},
+    "r_sn_": "01414644", "r_wel": 0, "g_alo": 300, "r_not": [],
+    "r_ses": {"last": 24, "size": 99999}, "r_hsh": 40, "suser": 0, "r_fsI": 32,
+}
+
+
 # ---------------------------------------------------------------- the charger
 
 class Charger:
@@ -57,7 +82,8 @@ class Charger:
 
     def __init__(self, profile="pulsar_max", pin=None, meter="voltage",
                  first_delay=0.0, chunk_delay=0.0, silent=(), notify_failures=0,
-                 proxy_has_passkey=True, pairing_wrong_pin=False):
+                 proxy_has_passkey=True, pairing_wrong_pin=False,
+                 write_delay=0.0, faults=None, slow_writes=(), reappear_delay=0.0):
         self.profile = PROFILES[profile]
         self.pin = pin
         self.meter = METERS[meter]
@@ -67,10 +93,21 @@ class Charger:
         self.notify_failures = notify_failures
         self.proxy_has_passkey = proxy_has_passkey
         self.pairing_wrong_pin = pairing_wrong_pin
+        self.write_delay = write_delay
+        # Request ordinal (1-based, across links) -> "late" | "stall" | "drop".
+        self.faults = dict(faults or {})
+        self.faulted_ids = {}  # request id -> fault, as the client numbered it
+        # Write-call ordinals (1-based) that take SLOW_WRITE_S to confirm.
+        self.slow_writes = set(slow_writes)
+        self.writes = 0
+        # After the client drops the link, how long until it advertises again.
+        self.reappear_delay = reappear_delay
+        self.hidden_until = 0.0
         self.bonded = False
         self.visible = True
         self.links = []
         self.requests = []  # (met, par) in arrival order, across links
+        self.request_ids = []  # the matching request ids
         self.garbled = 0
         # Charger state the commands act on.
         self.status = {"st": 1, "cur": 16, "L1": 160, "L2": 0, "L3": 0,
@@ -87,6 +124,9 @@ class Charger:
         """BAPI: (kind, value). kind is "r", "error", "top" or None (silent)."""
         if met in self.silent:
             return None, None
+        if getattr(self, "field", False) and met in FIELD_ANSWERS:
+            value = FIELD_ANSWERS[met]
+            return ("top", value) if met == "fw_v_" else ("r", value)
         table = {
             "r_dat": lambda: ("r", dict(self.status)),
             "r_fsI": lambda: ("r", 32),
@@ -166,6 +206,14 @@ class Link:
         if not self.is_connected:
             raise BleakError("Not connected")
         uuid = char if isinstance(char, str) else char.uuid
+        self.charger.writes += 1
+        delay = self.charger.write_delay
+        if self.charger.writes in self.charger.slow_writes:
+            delay = scaled(SLOW_WRITE_S)
+        if delay:
+            await asyncio.sleep(delay)
+            if not self.is_connected:
+                raise BleakError("Not connected")
         if uuid == self.charger.profile["mode"]:
             self.stream_mode = bytes(payload) == bytes([self.charger.profile["stream_mode"]])
             return
@@ -184,6 +232,11 @@ class Link:
         self.charger.bonded = True
 
     async def disconnect(self):
+        if self.is_connected and self.charger.reappear_delay:
+            # Field: after the client drops the link, the charger stopped
+            # advertising for minutes ("last advertisement 266s ago").
+            self.charger.hidden_until = (
+                asyncio.get_running_loop().time() + self.charger.reappear_delay)
         await self._drop(notify=False)
 
     # -- charger side ------------------------------------------------------
@@ -206,11 +259,15 @@ class Link:
             if self.desynced:
                 continue  # out of step until the link is rebuilt
             self.charger.requests.append((body["met"], body["par"]))
+            self.charger.request_ids.append(body["id"])
+            fault = self.charger.faults.get(len(self.charger.requests))
+            if fault:
+                self.charger.faulted_ids[body["id"]] = fault
             if body["met"] == "suser":
                 self.logins += 1
             kind, value = self.charger.answer(body["met"], body["par"])
-            if kind is not None:
-                task = asyncio.ensure_future(self._reply(body["id"], kind, value))
+            if kind is not None and fault != "drop":
+                task = asyncio.ensure_future(self._reply(body["id"], kind, value, fault))
                 self.pending.add(task)
                 task.add_done_callback(self.pending.discard)
 
@@ -219,18 +276,29 @@ class Link:
         self.desynced = True
         self.buffer.clear()
 
-    async def _reply(self, request_id, kind, value):
+    async def _reply(self, request_id, kind, value, fault=None):
         if kind == "r":
             message = {"id": request_id, "r": value}
         elif kind == "error":
             message = {"id": request_id, "error": value}
         else:
             message = {"id": request_id, **value}
-        data = json.dumps(message, separators=(",", ":")).encode()
-        await asyncio.sleep(self.charger.first_delay)
-        for i in range(0, len(data), 20):  # 23-byte ATT MTU
+        data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
+        if fault == "stall" and len(data) <= 40:
+            # Fewer than three pieces: there is no "halfway" to stall at, so
+            # this reply arrives normally and must not count as faulted.
+            self.charger.faulted_ids.pop(request_id, None)
+            fault = None
+        first = scaled(LATE_START_S) if fault == "late" else self.charger.first_delay
+        await asyncio.sleep(first)
+        for n, i in enumerate(range(0, len(data), 20)):  # 23-byte ATT MTU
             if not self.is_connected or self.notify is None:
                 return
+            if fault == "stall" and n == 2:
+                # Part of the reply is out, then a pause longer than the
+                # client's between-pieces timeout: the rest arrives while the
+                # client is already waiting for its next request's reply.
+                await asyncio.sleep(scaled(STALL_S))
             await self.notify(None, bytearray(data[i:i + 20]))
             await asyncio.sleep(self.charger.chunk_delay)
 
@@ -246,31 +314,37 @@ class Link:
 
 # ---------------------------------------------------------------- harness
 
-# Real values divided by ~10-100. What matters is kept: in the "slow" runs a
-# whole status reply takes longer than the first-piece timeout, while every
-# single gap stays under the between-pieces timeout.
-TIMERS = {
-    "RESPONSE_START_TIMEOUT_S": 0.3, "RESPONSE_GAP_TIMEOUT_S": 0.2,
-    "RESPONSE_TOTAL_TIMEOUT_S": 3, "WRITE_TIMEOUT_S": 0.5,
-    "HEALTH_CHECK_INTERVAL": 0.2, "STALE_RECONNECT_S": 1.5,
-    "RECONNECT_DELAY_S": 0.05,
-}
+# Every timer is the integration's own constant times SCALE, so the ratios
+# between them -- and against the link timings below, given in real seconds
+# and scaled the same way -- are the real ones.
+SCALE = 1 / 25
+API_TIMERS = ("RESPONSE_START_TIMEOUT_S", "RESPONSE_GAP_TIMEOUT_S",
+              "RESPONSE_TOTAL_TIMEOUT_S", "WRITE_TIMEOUT_S", "HEALTH_CHECK_INTERVAL",
+              "STALE_RECONNECT_S", "RECONNECT_DELAY_S", "RESPONSE_TIMEOUT_S")
 SLOW = dict(first_delay=0.2, chunk_delay=0.04)
 
 
-def scale_timers(monkeypatch, slow_poll=3.0):
-    for name, value in TIMERS.items():
-        monkeypatch.setattr(api, name, value)
-    monkeypatch.setattr(coordinator_mod, "SLOW_POLL_S", slow_poll)
-    monkeypatch.setattr(coordinator_mod, "SELF_RELOAD_STALE_S", 6)
-    monkeypatch.setattr(pairing, "PAIR_TIMEOUT_S", 1)
+def scaled(seconds):
+    return seconds * SCALE
+
+
+def scale_timers(monkeypatch, slow_poll=None):
+    for name in API_TIMERS:
+        if hasattr(api, name):
+            monkeypatch.setattr(api, name, getattr(api, name) * SCALE)
+    monkeypatch.setattr(coordinator_mod, "SLOW_POLL_S",
+                        slow_poll if slow_poll is not None else coordinator_mod.SLOW_POLL_S * SCALE)
+    monkeypatch.setattr(coordinator_mod, "SELF_RELOAD_STALE_S",
+                        coordinator_mod.SELF_RELOAD_STALE_S * SCALE)
+    monkeypatch.setattr(pairing, "PAIR_TIMEOUT_S", pairing.PAIR_TIMEOUT_S * SCALE)
 
 
 def wire(monkeypatch, charger, transport):
     """Point the integration's Bluetooth seams at the simulated charger."""
 
     def device_from_address(hass, address, connectable=True):
-        return object() if charger.visible else None
+        hidden = asyncio.get_running_loop().time() < charger.hidden_until
+        return object() if charger.visible and not hidden else None
 
     async def establish(_cls, _device, _address, disconnected_callback=None, **_):
         link = Link(charger, disconnected_callback)
@@ -336,7 +410,7 @@ class Run:
 
 
 def run_scenario(monkeypatch, charger, transport="proxy", pin=None, body=None,
-                 slow_poll=3.0):
+                 slow_poll=None):
     scale_timers(monkeypatch, slow_poll)
     wire(monkeypatch, charger, transport)
     run = Run(charger, pin)
@@ -586,3 +660,69 @@ def test_shutdown_mid_request_is_clean(monkeypatch):
         return run
 
     run_scenario(monkeypatch, charger, body=body)
+
+
+# ---------------------------------------------------------------- the field link
+
+def test_field_link(monkeypatch):
+    """Replays the link in a field log: a Pulsar Max (fw 6.13.6) behind an
+    ESPHome proxy, its real replies, the measured latency, and the faults
+    that log showed -- a write slower than the old 2 s write timeout, a reply
+    that starts after the first-piece timeout, one that stalls halfway, one
+    that never comes, and g_halocfg never answered.
+
+    Before the fix each slow write forced a reconnect (after which the
+    charger disappeared for minutes), and the stalled reply's tail poisoned
+    the next request too. Now exactly the faulted requests fail, nothing
+    else, on a single connection.
+    """
+    charger = Charger(
+        first_delay=scaled(REPLY_START_S), chunk_delay=scaled(REPLY_GAP_S),
+        write_delay=scaled(WRITE_S), silent={"g_halocfg"},
+        # Ordinals of requests as the charger receives them (setup sends
+        # r_dat + suser first, then each poll r_dat, r_sta, r_dca, ...).
+        faults={9: "stall", 15: "late", 21: "stall", 26: "drop", 31: "stall"},
+        slow_writes={40, 70},
+        reappear_delay=scaled(240),
+    )
+    charger.field = True
+    outcomes = []
+
+    async def body(run):
+        original = run.c.wb.request
+
+        async def recording(method, parameter=None):
+            # Identify the request by the frame the charger received for it
+            # (requests are serialised, so it is the next one to arrive).
+            before = len(charger.request_ids)
+            ok, result = await original(method, parameter)
+            rid = charger.request_ids[before] if len(charger.request_ids) > before else None
+            outcomes.append((rid, method, ok))
+            return ok, result
+
+        run.c.wb.request = recording
+        for _ in range(24):
+            await run.poll()
+            await asyncio.sleep(scaled(1))
+        return run
+
+    run = run_scenario(monkeypatch, charger, body=body)
+
+    assert len(charger.links) == 1, (
+        f"reconnected {len(charger.links) - 1}x -- a slow write must not force a reconnect")
+    assert charger.garbled == 0
+    assert len(charger.requests) >= 35, "the run did not get through the faults"
+
+    failed = {rid for rid, method, ok in outcomes if not ok and method != "g_halocfg"}
+    injected = set(charger.faulted_ids)
+    assert failed == injected, (
+        f"failed but not faulted: {sorted(failed - injected)} "
+        f"(a late reply poisoned the next request); "
+        f"faulted but not failed: {sorted(injected - failed)}")
+
+    c = run.c
+    assert c.available and c.status == "LOCKED" and c.locked is True
+    assert c.firmware == "6.13.6" and c.serial_number == "01414644"
+    assert c.meter.measured_power == 351 and c.voltage == 230 and c.voltage_source == "meter"
+    assert c.house_power == 351  # charger idle: everything is the house
+    assert c.realtime.get("grid") is None  # this firmware has no lifetime counter

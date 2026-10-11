@@ -36,8 +36,7 @@ automations cover.
   uses `r_sta.charger_status` = 19 to tell "locked, car" from "locked, no car".
 - **Lock state from `r_sta.lock_status`**, the charger's actual lock, instead of
   inferring it from status 6. Falls back to status 6 if `r_sta` is unavailable.
-- **Lifetime charged energy** (`r_sta.grid`, in Wh — not the 10 Wh units of
-  `r_dat.en`) and **max available current**.
+- **Max available current** (`r_sta`).
 - **Auto-lock** switch and delay (`g_alo` / `s_alo`). The charger stores one value,
   seconds, 0 = off, and answers with a bare number; switching off and on again
   restores the previous delay.
@@ -54,6 +53,26 @@ automations cover.
 
 ### Fixed
 
+- **A slow write no longer forces a reconnect.** Through an ESPHome proxy, every
+  20-byte write waits for an ATT write response relayed over Wi-Fi, and the 2 s write
+  timeout was hit routinely. Each hit forced a reconnect, after which the charger
+  stopped advertising for minutes ("last advertisement 266s ago … out of connection
+  slots"). That's the "comes back for a few seconds, then fails" seen in the field.
+  The timeout is now 10 s, which still bounds a genuinely wedged write.
+- **A late reply no longer breaks the requests after it.** When a reply started or
+  stalled past its timeout, the rest of it arrived while the next request was
+  waiting. The parser only resynced after a complete message, and a buffer starting
+  mid-message never completes, so that request failed too, and often the one after
+  it. Incoming text is now split into messages with resync: a message starts at `{"`
+  at the beginning or straight after `}` (a nested object always follows `:`, `,` or
+  `[`), leftovers of earlier replies are dropped, and truncated literals or numbers
+  count as incomplete, not garbage. Request ids are sequential, so a late reply can
+  never match the request now waiting. The first-piece timeout is 8 s (3–7 s seen in
+  the field).
+- **Removed "Lifetime charged energy".** It read `r_sta.grid`, which Pulsar Max
+  6.13.6 does not send. The reference gateway's field is `r_dat.grid`, and it's the
+  session's grid energy, not a lifetime total, which without solar repeats *Session
+  energy*.
 - **Long replies through a Bluetooth proxy are no longer cut off.** The reply timeout
   was a fixed 2 s for the whole reply. The Pulsar Max keeps a 23-byte ATT MTU, so a
   status reply arrives as a dozen or more notifications, each relayed over Wi-Fi by
@@ -112,6 +131,16 @@ automations cover.
 
 ### Tests
 
+- `test_field_link` replays a field log from a Pulsar Max (fw 6.13.6) behind an
+  ESPHome proxy: its real replies, the measured latency, and the faults that log
+  showed (a slow write, a reply starting late, one stalling halfway, one never coming,
+  `g_halocfg` never answered). It asserts that exactly the faulted requests fail, on
+  one connection. On `907f417` it reproduces both field symptoms: a slow write forces
+  a reconnect and the run stalls at 19 requests; and, without slow writes, two
+  unfaulted requests fail behind a late reply. Simulation timers are now the
+  integration's own constants × one scale factor, so their ratios are the real ones.
+  `tests/test_stream.py` covers the message splitter with real fragments, cut at every
+  position.
 - `tests/test_simulation.py`: end-to-end runs of the real connection loop, request
   path and coordinator against a simulated charger. 72 combinations of Bluetooth path
   × radio profile × passcode × meter × link speed, plus 9 failure scenarios. The

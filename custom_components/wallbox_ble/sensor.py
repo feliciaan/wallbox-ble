@@ -124,16 +124,6 @@ ENTITY_DESCRIPTIONS = (
         value_fn=lambda c: round(c.charger_power),
     ),
     WallboxBLESensorDescription(
-        key="lifetime_energy",
-        name="Lifetime charged energy",
-        device_class=SensorDeviceClass.ENERGY,
-        state_class=SensorStateClass.TOTAL_INCREASING,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        # r_sta.grid is in Wh, unlike the 10 Wh units of r_dat.en.
-        value_fn=_realtime("grid", scale=0.001, digits=2),
-        available_fn=_has_realtime("grid"),
-    ),
-    WallboxBLESensorDescription(
         key="max_available_current",
         name="Max available current",
         device_class=SensorDeviceClass.CURRENT,

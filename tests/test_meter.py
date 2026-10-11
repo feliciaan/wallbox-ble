@@ -272,7 +272,6 @@ def test_sensor_values_from_a_poll():
     assert value("house_current", c) == 6.0
     assert value("house_power", c) == 1410
     assert value("supply_voltage", c) == 235.0
-    assert value("lifetime_energy", c) == 1234.57  # r_sta.grid is Wh
     assert value("max_available_current", c) == 25
     assert value("ocpp_status", c) == "Not configured"
     assert value("latest_notification", c) == "Grounding fault"

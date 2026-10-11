@@ -173,7 +173,7 @@ Values of 77 or below are plain HCI errors, not SMP codes.
 **Controls:** lock, charge current, start/stop charging (while charging or paused),
 auto-lock on/off and delay, Halo LED brightness, reboot charger.
 
-**Charger:** status, car connected, session energy, lifetime charged energy, charging
+**Charger:** status, car connected, session energy, charging
 current and power, max available current, notifications. Diagnostics: supply voltage,
 total sessions, Power Boost limit, firmware, serial number, grounding, OCPP status
 (off by default).
@@ -229,8 +229,7 @@ circuits; then *Grid power* is your house figure.
 On a charger without a meter these sensors stay unavailable. The charger answers
 `r_dca` with BAPI error 4, after which the integration stops asking.
 
-For the Energy dashboard, use *Grid meter energy* for grid consumption and *Lifetime
-charged energy* for the charger. For the house alone, run *House power* through Home
+For the Energy dashboard, use *Grid meter energy* for grid consumption. For the house alone, run *House power* through Home
 Assistant's **Integral** helper (Riemann sum, method *left*).
 
 ## Requirements

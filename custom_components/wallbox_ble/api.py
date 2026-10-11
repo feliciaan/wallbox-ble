@@ -39,7 +39,14 @@ RECONNECT_DELAY_S = 1.0
 # task at current=1 for ~10 h (see write-up 2026-08-01). We therefore race the
 # write against this timeout and ABANDON the orphaned task WITHOUT awaiting it,
 # so control always returns to the caller after WRITE_TIMEOUT_S.
-WRITE_TIMEOUT_S = 2
+#
+# 10 s, not 2: through an ESPHome proxy every 20-byte write waits for an ATT
+# write response relayed over Wi-Fi, and 2 s was exceeded routinely in the
+# field. Each hit forced a reconnect, after which the charger stayed
+# unreachable for minutes ("last advertisement 266s ago ... out of connection
+# slots") -- far worse than waiting. 10 s still bounds a genuinely wedged
+# write.
+WRITE_TIMEOUT_S = 10
 
 # How long request() waits for the charger's reply. Replies arrive as many
 # small notifications -- the Pulsar Max keeps a 23-byte ATT MTU, so a status
@@ -48,7 +55,7 @@ WRITE_TIMEOUT_S = 2
 # (measured: ~1.8 s for a 2-byte reply through an ESPHome proxy). Instead,
 # wait for the first piece, then keep waiting while pieces keep coming,
 # within an overall cap. A charger that never answers still fails fast.
-RESPONSE_START_TIMEOUT_S = 5  # until the first piece of the reply
+RESPONSE_START_TIMEOUT_S = 8  # until the first piece (field: 3-7 s seen)
 RESPONSE_GAP_TIMEOUT_S = 3  # between pieces once the reply has started
 RESPONSE_TOTAL_TIMEOUT_S = 20  # whole reply, however steadily it arrives
 
@@ -141,6 +148,65 @@ def _is_auth_error(exc) -> bool:
         return True
     match = re.search(r"error=(-?\d+)", text)
     return match is not None and int(match.group(1)) in AUTH_ERROR_CODES
+
+
+_DECODER = json.JSONDecoder()
+
+
+def _message_starts(buf, begin):
+    """Offsets in buf where a charger message can begin.
+
+    Every message is a JSON object, so it starts with '{"'. Inside a message a
+    nested object always follows ':', ',' or '[', so '{"' at the very start
+    or right after a closing '}' is where a new message begins -- whether it
+    starts a notification or follows the tail of the previous message inside
+    the same one.
+    """
+    i = buf.find('{"', begin)
+    while i != -1:
+        if i == 0 or buf[i - 1] == "}":
+            yield i
+        i = buf.find('{"', i + 1)
+
+
+def _incomplete(err, buf):
+    """Whether a decode error just means "more of this message is coming"."""
+    tail = buf[err.pos:]
+    return (
+        err.pos >= len(buf)
+        or err.msg.startswith("Unterminated string")
+        or any(word.startswith(tail) for word in ("true", "false", "null"))
+        or (tail != "" and all(c in "-+0123456789.eE" for c in tail))
+    )
+
+
+def split_messages(buf):
+    """Take complete messages off the front of the incoming text.
+
+    Returns (messages, rest): rest is an incomplete message still arriving,
+    or "" when nothing left can start one. Text that cannot be part of any
+    message -- the tail of a reply whose head went to an earlier request,
+    after that request timed out -- is dropped, instead of sitting in front
+    of the next reply so that nothing after it ever parses.
+    """
+    messages = []
+    pos = 0
+    while True:
+        start = next(_message_starts(buf, pos), None)
+        if start is None:
+            # Keep a lone trailing '{' that may become '{"' with the next piece.
+            if buf.endswith("{") and (len(buf) == 1 or buf[-2] == "}"):
+                return messages, "{"
+            return messages, ""
+        try:
+            message, end = _DECODER.raw_decode(buf, start)
+        except json.JSONDecodeError as err:
+            if _incomplete(err, buf):
+                return messages, buf[start:]
+            pos = start + 1  # not a message after all; look further on
+            continue
+        messages.append(message)
+        pos = end
 
 
 def _drain_abandoned(task):
@@ -649,6 +715,7 @@ class WallboxBLEApiClient:
         # the connect sequence has finished (see ready).
         self._request_lock = asyncio.Lock()
         self._session_ready = False
+        self._last_request_id = random.randint(0, 998)
         # suser login done on the current connection (see async_login).
         self.logged_in = False
         # Set once BlueZ turns out not to know this charger (it is served by a
@@ -663,7 +730,7 @@ class WallboxBLEApiClient:
         return self
 
     async def get_parsed_response(self, request_id):
-        data = bytearray()
+        data = ""
         while True:
             # Deliberately outside the try: CancelledError must propagate. A
             # bare `except:` here used to swallow it, which (a) defeated the
@@ -671,16 +738,13 @@ class WallboxBLEApiClient:
             # -- so an unanswered request hung polling for good, and (b) left
             # Home Assistant unable to cancel the refresh task at shutdown.
             timeout = RESPONSE_GAP_TIMEOUT_S if data else RESPONSE_START_TIMEOUT_S
-            data += await asyncio.wait_for(self.rx_queue.get(), timeout)
-            try:
-                parsed_data = json.loads(data)
-            except ValueError:
-                # Replies arrive split over several notifications; keep
-                # reading until the JSON is complete.
-                continue
-            LOGGER.debug(f"Got {parsed_data=}")
-            try:
-                if parsed_data["id"] == request_id:
+            chunk = await asyncio.wait_for(self.rx_queue.get(), timeout)
+            # Replies arrive split over several notifications; split_messages
+            # reassembles them and drops leftovers of earlier replies.
+            messages, data = split_messages(data + bytes(chunk).decode("utf-8", "replace"))
+            for parsed_data in messages:
+                LOGGER.debug(f"Got {parsed_data=}")
+                if parsed_data.get("id") == request_id:
                     # A BAPI error has no "r", so callers would just see None;
                     # keep the error so they can tell "not supported" (e.g.
                     # code 4 for a meter that is not fitted) from no data.
@@ -689,13 +753,7 @@ class WallboxBLEApiClient:
                     # (fw_v_ puts its fields at the top level).
                     self.last_response = parsed_data
                     return parsed_data.get("r")
-            except (KeyError, TypeError):
-                pass
-            # A complete frame that is not the answer to this request (an
-            # earlier request's late reply, or not a reply at all): drop it, or
-            # it would stay in front of the real answer and nothing after it
-            # would parse.
-            data = bytearray()
+                # Otherwise a late reply to an earlier request: skip it.
 
     def clear_rx_queue(self):
         self.rx_queue = asyncio.Queue()
@@ -810,7 +868,10 @@ class WallboxBLEApiClient:
             LOGGER.debug(f"NOT CONNECTED! {self.client}")
             return False, None
 
-        request_id = random.randint(1, 999)
+        # Sequential, not random: a late reply to an earlier request then can
+        # never carry the id this request is waiting for.
+        self._last_request_id = self._last_request_id % 999 + 1
+        request_id = self._last_request_id
 
         uart_service = self.client.services.get_service(self.service_uuid)
         if uart_service is None:

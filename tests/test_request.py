@@ -44,6 +44,7 @@ def make_client(monkeypatch, link):
     client._disconnected_event = asyncio.Event()
     client._pair_lock = asyncio.Lock()
     client._request_lock = asyncio.Lock()
+    client._last_request_id = 0
     client._session_ready = True
     client._last_write_exc = None
     client.last_error = client.last_response = None
