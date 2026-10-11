@@ -24,6 +24,10 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
   re-running SMP. Removing the config entry removes the bond too.
 - Pulsar Max row in the README's BLE profile table, and a troubleshooting section
   for the `Insufficient authentication` write error.
+- `tests/`: pytest suite (47 tests) runnable without Home Assistant installed —
+  `python -m pytest tests`. Covers the BlueZ agent against a faked bus, passcode
+  parsing, error classification, SMP decoding, shutdown, and the proxy pairing
+  race above (which hangs on the code before the fix).
 
 ### Fixed
 
@@ -46,6 +50,18 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 - Warnings from the connect path are logged once per client instead of once per
   reconnect attempt, which is every second while a link is failing — keyed by
   cause, so a changing failure is still reported.
+- Pairing over a Bluetooth proxy now sends one request per connection. The
+  coordinator's poll starts as soon as the link is up, before setup finishes, so
+  a rejected write retried pairing *while the connect path's own request was
+  still in flight*. The proxy answers once per `AUTH_CMPL`, so the overlapping
+  request got no answer and hung for the full 30 s API timeout; then the failed
+  write forced a reconnect, dropping the link under the pending request
+  ("changed connection status while waiting for BluetoothDevicePairingResponse").
+  Pairing is now serialised behind a lock with the result cached per link, a
+  poll that hits a pairing in progress simply fails that poll, and an
+  authentication rejection no longer forces a reconnect — reconnecting cannot
+  authenticate a link. The 60 s health check still reconnects a link that stays
+  unusable, which gives one fresh pairing attempt per minute.
 - A Bluetooth proxy's bare pairing error number is now decoded. ESPHome forwards
   ESP-IDF's `auth_cmpl.fail_reason`, which Bluedroid offsets by
   `BTA_DM_AUTH_FAIL_BASE` (`HCI_ERR_MAX_ERR` 0x43 + 10 = 77), so e.g. `error: 80`

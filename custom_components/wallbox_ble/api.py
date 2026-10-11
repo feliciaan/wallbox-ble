@@ -386,6 +386,18 @@ class WallboxBLEApiClient:
             # Called before connecting; the post-connect retry path will get
             # another go once the link is up.
             return False
+        async with self._pair_lock:
+            # One pairing request per connection. The proxy answers once per
+            # AUTH_CMPL, so a second request while SMP is already running gets
+            # no response of its own and hangs for the full 30 s API timeout;
+            # and repeating a request that already failed on this link only
+            # repeats the failure. Concurrent callers share the first result.
+            if self._link_pair_result is None:
+                self._link_pair_result = await self._async_pair_over_link_once()
+            return self._link_pair_result
+
+    async def _async_pair_over_link_once(self):
+        """Send one pairing request over the current link; see the caller."""
         try:
             await self.client.pair()
         except NotImplementedError:
@@ -463,6 +475,8 @@ class WallboxBLEApiClient:
                     disconnected_callback=disconnected_callback,
                 )
                 LOGGER.debug("Connected!")
+                # New link: allow one fresh pairing attempt on it.
+                self._link_pair_result = None
                 # Detect which BLE radio profile this charger exposes and use
                 # its UUIDs for the rest of the session.
                 self.detect_profile()
@@ -589,6 +603,10 @@ class WallboxBLEApiClient:
         # Keys of warnings already emitted, so a second-by-second reconnect loop
         # reports each distinct problem once.
         self._warned = set()
+        # Serialises pairing requests, and caches this link's single attempt
+        # (None = not tried yet on the current connection).
+        self._pair_lock = asyncio.Lock()
+        self._link_pair_result = None
         # Set once BlueZ turns out not to know this charger (it is served by a
         # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
         # lookup on every later reconnect.
@@ -719,6 +737,14 @@ class WallboxBLEApiClient:
         self.clear_rx_queue()
         ok = await self._send_frame(rx_char, data)
 
+        if not ok and _is_auth_error(self._last_write_exc) and self._pair_lock.locked():
+            # The connect path is pairing this very link right now (the poll
+            # runs as soon as the link is up, before setup finishes). Do not
+            # issue a second pairing request and do not tear the link down
+            # under it: this poll just fails, the next one runs on the result.
+            LOGGER.debug("Write rejected while pairing is in progress; skipping")
+            return False, None
+
         if not ok and _is_auth_error(self._last_write_exc):
             # This charger accepts the notification CCCD write on an unencrypted
             # link but refuses the command write, so a rejected WRITE -- not a
@@ -736,7 +762,13 @@ class WallboxBLEApiClient:
             # Returning here — instead of hanging — is the fix for the
             # controller task that was pinned at current=1 for hours.
             if _is_auth_error(self._last_write_exc):
+                # Reconnecting cannot authenticate a link, and doing it here
+                # would kill any pairing still in flight on it. Keep the link;
+                # the health check reconnects after STALE_RECONNECT_S without a
+                # successful read, which gives a fresh pairing attempt at a
+                # sane pace instead of one per poll.
                 self._log_auth_help()
+                return False, None
             LOGGER.warning("BLE write did not complete; abandoning and forcing reconnect")
             self._disconnected_event.set()
             return False, None
