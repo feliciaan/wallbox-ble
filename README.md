@@ -187,40 +187,51 @@ Bluetooth proxy down; changing a setting re-reads them immediately.
 ## Grid meter (Power Boost)
 
 Chargers fitted with Wallbox's **Power Boost** meter report what that meter measures,
-read over BLE with BAPI `r_dca`. Everything is worked out from the meter's **current**.
-Power Boost only needs current to do its job, and the meter is often wired without a
-voltage reference, in which case its own power, voltage and energy readings are all 0.
+read over BLE with BAPI `r_dca`.
 
 | Sensor | Meaning |
 | --- | --- |
 | **Grid current** / **Grid power** | Everything through the grid connection |
 | **House current / power (excl. charger)** | Grid minus the charger's own draw |
-| Grid meter energy | The meter's own counter. Off by default: it stays at 0 without a voltage reference |
+| **Grid meter energy** | The meter's lifetime counter, kWh. Needs a voltage reference (below) |
 
-**Where the voltage comes from.** The charger has no voltage reading either, but while
-charging it reports its own power (`cp`) as well as its current, so voltage = power ÷
-current. That value is kept between charges, and 230 V is used until the first charge.
-It appears as the *Supply voltage* diagnostic sensor, whose `measured` attribute says
-which of the two it is. The same voltage converts the charger, grid and house currents
-into watts, so the figures add up: grid = house + charger.
+**Wire the meter's voltage reference if you can.** Power Boost itself only needs the
+current clamp, so meters are often installed without one; the meter then reports 0 for
+power, voltage and energy. With it wired:
+- *Grid power* is the meter's own **active power**. That accounts for power factor,
+  which current × voltage does not.
+- *Grid meter energy* becomes available and can be used in the Energy dashboard.
+- The meter becomes the voltage source (below).
+
+Without it, grid and house power are worked out as current × voltage, and *Grid meter
+energy* stays unavailable rather than showing 0.
+
+**Where the voltage comes from**, best source first; the *Supply voltage* sensor's
+`source` attribute says which one is in use:
+1. `meter`: the Power Boost meter, when it has a voltage reference.
+2. `charger`: the charger reports no voltage, but while charging it reports its power
+   (`cp`) and its current, so voltage = power ÷ current.
+3. The last value seen, between charges.
+4. `nominal`: 230 V before any of the above.
 
 **What "house" means here.** Power Boost meters are installed at the main connection,
-so they measure the whole supply *including the charger*; the rest of the house is
-grid minus charger. House current is never shown below 0: without generation on the
-connection the house cannot feed the grid, so a slightly negative difference is only
-the two instruments disagreeing.
+so they measure the whole supply *including the charger*. House = grid − charger, using
+the charger's own reported power, so grid = house + charger. House is never shown below
+0, and the direction of the meter's reading is ignored: without generation on the
+connection the house cannot feed the grid, so a negative value is only instrument
+mismatch or a clamp fitted the wrong way round.
 
 **Check your installation once.** Start charging while the house is otherwise quiet.
-*Grid current* should rise by about the charging current while *House current* barely
-moves. If grid current doesn't change when charging starts, your meter only sees the
-house circuits; then *Grid power* is your house figure.
+*Grid power* should rise by about the charging power while *House power* barely moves.
+If grid power doesn't change when charging starts, your meter only sees the house
+circuits; then *Grid power* is your house figure.
 
 On a charger without a meter these sensors stay unavailable. The charger answers
 `r_dca` with BAPI error 4, after which the integration stops asking.
 
-For the Energy dashboard, use *Lifetime charged energy* for the charger. For the
-house, run *House power* through Home Assistant's **Integral** helper (Riemann sum,
-method *left*).
+For the Energy dashboard, use *Grid meter energy* for grid consumption and *Lifetime
+charged energy* for the charger. For the house alone, run *House power* through Home
+Assistant's **Integral** helper (Riemann sum, method *left*).
 
 ## Requirements
  - Home Assistant with a working Bluetooth integration — either a local adapter

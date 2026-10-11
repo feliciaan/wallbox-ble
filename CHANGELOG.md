@@ -18,17 +18,20 @@ automations cover.
 
 ### Added
 
-- **Grid and house current and power from the Power Boost meter** (BAPI `r_dca`),
-  worked out from the meter's current only (`c1..c3`, 0.1 A). Power Boost needs
-  nothing else, and a meter wired without a voltage reference reports 0 for power,
-  voltage and energy. House = grid − charger, since the meter sits at the grid
-  connection; never below 0. The reference gateway's "House Power" is the raw grid
-  sum, which overstates the house by the charging power.
-- **Supply voltage, from the charger.** It has no voltage field, but while charging it
-  reports its power (`r_dat.cp`, kW) and its current, so voltage = power ÷ current
-  (only at ≥ 5 A, and only if 180–260 V). Kept between charges; 230 V until the first.
-  The same voltage converts charger, grid and house current to watts, so
-  grid = house + charger, and charger power equals `cp` while charging.
+- **Grid and house current and power from the Power Boost meter** (BAPI `r_dca`).
+  With the meter's voltage reference wired, grid power is the meter's own active power
+  (`p1..p3`) and its energy counter (`e`, Wh) is exposed. Without one, the meter
+  reports 0 for power, voltage and energy, so grid power falls back to current
+  (`c1..c3`, 0.1 A) × voltage and the energy sensor stays unavailable instead of
+  showing 0. House = grid − the charger's own reported power, since the meter sits
+  at the grid connection; never below 0, and the reading's direction is ignored
+  (no generation, so negative is only mismatch or a reversed clamp). The reference
+  gateway's "House Power" is the raw grid sum, which overstates the house by the
+  charging power.
+- **Supply voltage**, best source first: the meter when it has a voltage reference;
+  else the charger's power ÷ current while charging (`r_dat.cp` is kW; used only at
+  ≥ 5 A and 180–260 V), since the charger reports no voltage; else the last value;
+  else 230 V. Its `source` attribute names which.
 - **Car connected** binary sensor, from the status code; while locked (status 6) it
   uses `r_sta.charger_status` = 19 to tell "locked, car" from "locked, no car".
 - **Lock state from `r_sta.lock_status`**, the charger's actual lock, instead of
@@ -62,7 +65,8 @@ automations cover.
 - BAPI error responses are kept rather than discarded, so "not supported" (error 4)
   is told apart from a missed answer: only error 4 stops meter polling, and a missed
   answer keeps the last reading instead of flapping sensors to unavailable.
-- Charging power is current × the supply voltage above, rather than × a fixed 230 V.
+- Charging power is the charger's own reported power (`r_dat.cp`) where it reports
+  one, else current × the supply voltage above, rather than current × a fixed 230 V.
 
 ## [0.5.0] - 2026-08-31
 

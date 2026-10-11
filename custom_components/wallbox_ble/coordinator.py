@@ -57,11 +57,12 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         # charger has one at all (None until it has answered once).
         self.meter = None
         self.meter_supported = None
-        # Supply voltage: worked out from the charger's power and current
-        # while charging (it reports no voltage itself), kept between charges,
-        # nominal until the first one. voltage_measured says which.
+        # Supply voltage, best source first: the Power Boost meter when it has
+        # a voltage reference; else the charger's power / current while it
+        # charges (it reports no voltage itself); else the last value seen;
+        # else nominal. voltage_source says which.
         self.voltage = charger.NOMINAL_VOLTAGE
-        self.voltage_measured = False
+        self.voltage_source = "nominal"
         # r_sta: lock state, max available current, lifetime energy, ...
         self.realtime = {}
         # Read every SLOW_POLL_S.
@@ -139,9 +140,9 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self.charge_current = data.get("cur", 6)
             self.status = self._status_name(self.status_code)
             self.available = True
-            self._update_voltage(data)
             await self._async_update_realtime()
             await self._async_update_meter()
+            self._update_voltage(data)
             await self._async_update_slow()
             return data
         else:
@@ -157,10 +158,14 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         return f"UNKNOWN_{code}"
 
     def _update_voltage(self, status):
+        """Pick the best voltage available this poll (see __init__)."""
+        if self.meter is not None and self.meter.measured_voltage is not None:
+            self.voltage, self.voltage_source = self.meter.measured_voltage, "meter"
+            return
         voltage = charger.implied_voltage(status)
         if voltage is not None:
-            self.voltage = voltage
-            self.voltage_measured = True
+            self.voltage, self.voltage_source = voltage, "charger"
+        # Otherwise keep the last value and its source.
 
     async def _async_update_realtime(self):
         """r_sta: the charger's own lock state and a few live counters."""
@@ -226,9 +231,12 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         LOGGER.debug("Charger info: firmware=%s serial=%s grounding=%s",
                      self.firmware, self.serial_number, self.grounding)
 
-    # --- derived figures, all from current x the same voltage --------------
-    # Using one voltage for the charger, the grid and the house keeps them
-    # consistent: grid = house + charger (unless house is clamped at 0).
+    # --- derived figures ------------------------------------------------------
+    # Measured power wherever an instrument reports it: the charger's own
+    # power reading, and the meter's when it has a voltage reference. Only
+    # what is not measured is worked out as current x self.voltage. House is
+    # grid minus charger, so grid = house + charger unless house is clamped
+    # at 0.
 
     @property
     def charger_current(self) -> float:
@@ -236,11 +244,15 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
 
     @property
     def charger_power(self) -> float:
-        return self.charger_current * self.voltage
+        measured = charger.charging_power(self.data)
+        return measured if measured is not None else self.charger_current * self.voltage
 
     @property
     def grid_power(self) -> float | None:
-        return None if self.meter is None else self.meter.grid_current * self.voltage
+        if self.meter is None:
+            return None
+        measured = self.meter.measured_power
+        return measured if measured is not None else self.meter.grid_current * self.voltage
 
     @property
     def house_current(self) -> float | None:
@@ -248,8 +260,11 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
 
     @property
     def house_power(self) -> float | None:
-        amps = self.house_current
-        return None if amps is None else amps * self.voltage
+        grid = self.grid_power
+        if grid is None:
+            return None
+        # Never below zero, for the same reason as house_current.
+        return max(0.0, grid - self.charger_power)
 
     @property
     def car_connected(self):

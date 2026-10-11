@@ -12,6 +12,9 @@ sensor_mod = load("sensor")
 # A meter wired without a voltage reference: only the current means anything.
 CURRENT_ONLY = {"v1": 0, "v2": 0, "v3": 0, "p1": 0, "p2": 0, "p3": 0,
                 "c1": 220, "c2": 0, "c3": 0, "e": 0}
+# The same install with the voltage reference wired: 22 A at 238 V, PF ~0.95.
+VOLTAGE_WIRED = {"v1": 238, "v2": 0, "v3": 0, "p1": 4975, "p2": 0, "p3": 0,
+                 "c1": 220, "c2": 0, "c3": 0, "e": 8123456}
 
 
 # ---------------------------------------------------------------- decoding
@@ -19,6 +22,31 @@ CURRENT_ONLY = {"v1": 0, "v2": 0, "v3": 0, "p1": 0, "p2": 0, "p3": 0,
 def test_current_only_meter():
     r = meter.parse_meter(CURRENT_ONLY)
     assert r.grid_current == pytest.approx(22.0)  # 0.1 A units
+
+
+def test_current_only_meter_has_no_measured_power():
+    r = meter.parse_meter(CURRENT_ONLY)
+    assert not r.has_voltage
+    assert r.measured_power is None and r.measured_voltage is None
+
+
+def test_voltage_wired_meter():
+    r = meter.parse_meter(VOLTAGE_WIRED)
+    assert r.has_voltage
+    assert r.measured_voltage == 238
+    assert r.measured_power == 4975
+    assert r.energy_kwh == pytest.approx(8123.456)
+
+
+def test_reversed_clamp_reads_as_import():
+    r = meter.parse_meter({**VOLTAGE_WIRED, "p1": -4975})
+    assert r.measured_power == 4975
+
+
+def test_implausible_voltage_is_not_a_reference():
+    # A floating voltage input reading a few volts is not a wired reference.
+    r = meter.parse_meter({**VOLTAGE_WIRED, "v1": 12, "p1": 260})
+    assert not r.has_voltage and r.measured_power is None
 
 
 def test_three_phase_current_sums():
@@ -107,7 +135,7 @@ def test_full_poll_while_charging():
     run_poll(c)
 
     assert c.status == "CHARGING" and c.car_connected is True
-    assert c.voltage == pytest.approx(235.0) and c.voltage_measured
+    assert c.voltage == pytest.approx(235.0) and c.voltage_source == "charger"
     assert c.charger_power == pytest.approx(3760)  # = cp, via the same voltage
     assert c.grid_power == pytest.approx(22 * 235)
     assert c.house_current == pytest.approx(6.0)
@@ -135,7 +163,33 @@ def test_voltage_is_kept_between_charges():
 def test_nominal_voltage_until_the_first_charge():
     c = make({"st": 0, "L1": 0})
     run_poll(c)
-    assert c.voltage == 230.0 and not c.voltage_measured
+    assert c.voltage == 230.0 and c.voltage_source == "nominal"
+
+
+def test_voltage_wired_meter_takes_over():
+    # Charging 16 A (cp 3.76 kW); the meter measures 238 V and 4975 W in total.
+    answers = {**ANSWERS, "r_dca": VOLTAGE_WIRED}
+    c = make({"st": 1, "L1": 160, "cp": 3.76}, answers)
+    run_poll(c)
+    assert c.voltage == 238 and c.voltage_source == "meter"
+    assert c.grid_power == 4975  # measured active power, not 22 A x 238 V
+    assert c.charger_power == pytest.approx(3760)  # the charger's own cp
+    assert c.house_power == pytest.approx(4975 - 3760)
+    assert c.grid_power == pytest.approx(c.house_power + c.charger_power)
+
+
+def test_meter_voltage_beats_the_charger_and_survives_idle():
+    answers = {**ANSWERS, "r_dca": VOLTAGE_WIRED}
+    c = make({"st": 0, "L1": 0, "cp": 0}, answers)
+    run_poll(c)
+    assert c.voltage_source == "meter"  # no charge needed
+    assert c.house_power == 4975  # idle charger: everything is house
+
+
+def test_charger_power_without_cp_falls_back_to_current():
+    c = make({"st": 1, "L1": 160})
+    run_poll(c)
+    assert c.charger_power == pytest.approx(16 * 230)
 
 
 def test_status_19_no_longer_crashes():
@@ -220,9 +274,14 @@ def test_meter_sensors_unavailable_without_a_meter():
         assert value(key, c) is None
 
 
-def test_meter_energy_is_off_by_default():
-    # Meaningless on a meter without a voltage reference.
-    assert describe("grid_energy").entity_registry_enabled_default is False
+def test_meter_energy_only_with_a_voltage_reference():
+    c = make({"st": 0, "L1": 0}, {**ANSWERS, "r_dca": CURRENT_ONLY})
+    run_poll(c)
+    assert not available("grid_energy", c)  # would read 0
+    c = make({"st": 0, "L1": 0}, {**ANSWERS, "r_dca": VOLTAGE_WIRED})
+    run_poll(c)
+    assert available("grid_energy", c) and value("grid_energy", c) == 8123.46
+    assert describe("grid_energy").entity_registry_enabled_default is True
 
 
 def test_status_code_list_covers_19():

@@ -186,11 +186,10 @@ ENTITY_DESCRIPTIONS = (
         device_class=SensorDeviceClass.ENERGY,
         state_class=SensorStateClass.TOTAL_INCREASING,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        # Only meaningful when the meter has a voltage reference; off by
-        # default because a current-only install reports 0 here.
-        entity_registry_enabled_default=False,
         value_fn=lambda c: None if c.meter is None else _rounded(c.meter.energy_kwh, 2),
-        available_fn=_has_meter,
+        # Only meaningful with a voltage reference: without one the meter
+        # cannot integrate power and reports 0.
+        available_fn=lambda c: c.meter is not None and c.meter.has_voltage,
     ),
     WallboxBLESensorDescription(
         key="supply_voltage",
@@ -309,6 +308,6 @@ class WallboxBLESensor(WallboxBLEEntity, SensorEntity):
     @property
     def extra_state_attributes(self):
         if self.entity_description.key == "supply_voltage":
-            # Whether this is the charger-derived value or the 230 V default.
-            return {"measured": self.coordinator.voltage_measured}
+            # meter / charger (power / current) / nominal (230 V).
+            return {"source": self.coordinator.voltage_source}
         return None
