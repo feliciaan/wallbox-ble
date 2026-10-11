@@ -41,6 +41,8 @@ def make_client(monkeypatch, link):
     client.rx_queue = asyncio.Queue()
     client._disconnected_event = asyncio.Event()
     client._pair_lock = asyncio.Lock()
+    client._request_lock = asyncio.Lock()
+    client._session_ready = True
     client._last_write_exc = None
     client.last_error = client.last_response = None
     return client
@@ -129,3 +131,64 @@ def test_success_clears_the_failure(monkeypatch):
         return client.last_failure
 
     assert asyncio.run(scenario()) is None
+
+
+# ---------------------------------------------------------------- one at a time
+
+class AnsweringLink(SilentLink):
+    """Answers each complete EaE frame; records every byte written, in order."""
+
+    def __init__(self):
+        super().__init__()
+        self.client = None
+        self.stream = bytearray()
+
+    async def write_gatt_char(self, _char, payload, _response):
+        self.stream += payload
+        self.writes.append(bytes(payload))
+        # A whole frame is b"EaE" + length byte + JSON + checksum byte.
+        if len(self.stream) >= 4 and self.stream[:3] == b"EaE":
+            size = 4 + self.stream[3] + 1
+            if len(self.stream) >= size:
+                frame, self.stream = bytes(self.stream[:size]), self.stream[size:]
+                request_id = json.loads(frame[4:-1])["id"]
+                reply = json.dumps({"id": request_id, "r": "ok"}).encode()
+                self.client.rx_queue.put_nowait(reply)
+
+
+def _frames(chunks):
+    """Split the written byte stream into EaE frames; fail if they are mixed."""
+    stream, frames = b"".join(chunks), []
+    while stream:
+        assert stream[:3] == b"EaE", f"stream lost frame sync at {stream[:12]!r}"
+        size = 4 + stream[3] + 1
+        frames.append(json.loads(stream[4:size - 1]))
+        stream = stream[size:]
+    return frames
+
+
+def test_concurrent_requests_do_not_interleave(monkeypatch):
+    async def scenario():
+        link = AnsweringLink()
+        client = make_client(monkeypatch, link)
+        link.client = client
+        # Parameters long enough that every frame takes several 20-byte writes.
+        results = await asyncio.gather(*(
+            client.request(f"m_{i}", {"padding": "x" * 30}) for i in range(4)
+        ))
+        return link, results
+
+    link, results = asyncio.run(scenario())
+    frames = _frames(link.writes)
+    assert [f["met"] for f in frames] == ["m_0", "m_1", "m_2", "m_3"]
+    assert results == [(True, "ok")] * 4
+
+
+def test_not_ready_until_setup_finishes(monkeypatch):
+    client = make_client(monkeypatch, SilentLink())
+    client._session_ready = False
+    assert not client.ready, "polling would race the connect sequence"
+    client._session_ready = True
+    assert client.ready
+    client.client.is_connected = False
+    assert not client.ready

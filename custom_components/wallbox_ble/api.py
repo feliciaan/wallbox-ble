@@ -460,6 +460,7 @@ class WallboxBLEApiClient:
 
         while True:
             LOGGER.debug("Connecting...")
+            self._session_ready = False
             # Reset any pending reconnect signal (from a prior disconnect or an
             # abandoned write) BEFORE we connect, so the fresh link is not torn
             # down immediately.
@@ -527,8 +528,9 @@ class WallboxBLEApiClient:
                 # own user id, which we read back from r_dat) so that control
                 # commands (lock, charge current, ...) are accepted.
                 await self.authenticate()
-                # Mark the link healthy on (re)connect.
+                # Mark the link healthy on (re)connect, and let polling start.
                 self.last_success = asyncio.get_running_loop().time()
+                self._session_ready = True
                 # Variant A: do NOT block forever on disconnected_callback (it may
                 # never fire on a silent link death). Wake periodically and force a
                 # reconnect if no successful read landed for STALE_RECONNECT_S.
@@ -549,6 +551,7 @@ class WallboxBLEApiClient:
                 LOGGER.debug(f"Error: {type(e)}, {e}")
                 await asyncio.sleep(1.0)
             finally:
+                self._session_ready = False
                 if self.client is not None:
                     with contextlib.suppress(Exception):
                         await self.client.disconnect()
@@ -616,6 +619,10 @@ class WallboxBLEApiClient:
         # (None = not tried yet on the current connection).
         self._pair_lock = asyncio.Lock()
         self._link_pair_result = None
+        # One BAPI request in flight at a time (see request()), and whether
+        # the connect sequence has finished (see ready).
+        self._request_lock = asyncio.Lock()
+        self._session_ready = False
         # Set once BlueZ turns out not to know this charger (it is served by a
         # Bluetooth proxy). Logs the hint once, and short-circuits the D-Bus
         # lookup on every later reconnect.
@@ -665,8 +672,17 @@ class WallboxBLEApiClient:
         self.rx_queue = asyncio.Queue()
 
     @property
+    def _link_up(self):
+        return bool(self.client and self.client.is_connected)
+
+    @property
     def ready(self):
-        return self.client and self.client.is_connected
+        """Connected AND set up (notifications, stream mode, pairing, login).
+
+        The coordinator polls on this. It used to be true as soon as the link
+        connected, so polling raced the setup sequence's own requests.
+        """
+        return self._link_up and self._session_ready
 
     async def _write_abandonable(self, char, payload) -> bool:
         """Write one BLE chunk, returning True only on confirmed completion.
@@ -741,12 +757,27 @@ class WallboxBLEApiClient:
             )
 
     async def request(self, method, parameter=None):
+        """Send one BAPI command and wait for its reply. One at a time.
+
+        A frame goes out as several 20-byte writes with awaits in between, so
+        two overlapping requests interleave their pieces on the charger's UART.
+        The frame carries its own length, so a mixed stream throws the
+        charger's parser out of step and it stops answering -- every request
+        then times out until the link is rebuilt, and rebuilding just collides
+        again. The reference gateway keeps exactly one request in flight for
+        the same reason (its _cmdMutex). The lock also covers the reply wait,
+        which shares rx_queue.
+        """
+        async with self._request_lock:
+            return await self._request(method, parameter)
+
+    async def _request(self, method, parameter=None):
         # Why the last request failed: "timeout" when the charger simply did
         # not answer, None for success or any other failure (link down, write
         # rejected). Lets the coordinator tell an unsupported read from a
         # dead link.
         self.last_failure = None
-        if not self.ready:
+        if not self._link_up:
             LOGGER.debug(f"NOT CONNECTED! {self.client}")
             return False, None
 

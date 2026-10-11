@@ -54,6 +54,19 @@ automations cover.
 
 ### Fixed
 
+- **One charger request in flight at a time, and no polling until the connection is
+  set up.** A command goes out as several 20-byte writes with awaits in between, and
+  nothing stopped two requests overlapping, so their pieces interleaved on the
+  charger's serial link. Each frame carries its own length, so a mixed stream throws
+  the charger's parser out of step and it stops answering. `ready` was also true as
+  soon as Bluetooth connected, so polling raced the connect sequence's own requests
+  (pairing, login). This was rare with one or two requests per poll; the reads added
+  in this release made the first poll after a connect send about 11, so every
+  connection and every self-heal reload collided with itself and never recovered
+  ("BLE unrecoverable for >180s" every 3 minutes, no data). `request()` now holds a
+  lock across the write and the reply wait, as the reference gateway does
+  (`_cmdMutex`), and `ready` waits for the connect sequence to finish. A test sends
+  four requests at once: on the old code the frames reach the charger corrupted.
 - **An unanswered request no longer hangs polling for good, and Home Assistant can
   shut down cleanly.** The reply parser wrapped everything in a bare `except:`,
   which also catches `asyncio.CancelledError`. asyncio delivers a timeout as a

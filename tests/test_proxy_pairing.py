@@ -58,6 +58,8 @@ def make_client(link):
     client.pairing_auth_failed = False
     client._last_write_exc = None
     client._pair_lock = asyncio.Lock()
+    client._request_lock = asyncio.Lock()
+    client._session_ready = True
     client._link_pair_result = None
     return client
 
