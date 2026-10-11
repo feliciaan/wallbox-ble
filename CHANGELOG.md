@@ -10,158 +10,62 @@ This is a fork of [jagheterfredrik/wallbox-ble](https://github.com/jagheterfredr
 ## [0.6.0] - 2026-10-11
 
 Brings over the charger features of the `botts7/esp32-wallbox` gateway that work
-through an ordinary Bluetooth proxy, so the charger no longer needs a dedicated ESP32
-for them. Left out on purpose: solar (Eco-Smart, live solar session data), phase
-switching and dynamic power sharing (single-phase, single-charger installs), and the
-gateway's own health sensors and schedule/reminder logic, which Home Assistant
-automations cover.
+through an ordinary Bluetooth proxy, so no dedicated ESP32 is needed. Left out on
+purpose: solar (Eco-Smart), phase switching, dynamic power sharing, and the gateway's
+own health sensors and schedules, which Home Assistant automations cover.
 
 ### Added
 
-- **Grid and house current and power from the Power Boost meter** (BAPI `r_dca`).
-  With the meter's voltage reference wired, grid power is the meter's own active power
-  (`p1..p3`) and its energy counter (`e`, Wh) is exposed. Without one, the meter
-  reports 0 for power, voltage and energy, so grid power falls back to current
-  (`c1..c3`, 0.1 A) × voltage and the energy sensor stays unavailable instead of
-  showing 0. House = grid − the charger's own reported power, since the meter sits
-  at the grid connection; never below 0, and the reading's direction is ignored
-  (no generation, so negative is only mismatch or a reversed clamp). The reference
-  gateway's "House Power" is the raw grid sum, which overstates the house by the
-  charging power.
-- **Supply voltage**, best source first: the meter when it has a voltage reference;
-  else the charger's power ÷ current while charging (`r_dat.cp` is kW; used only at
-  ≥ 5 A and 180–260 V), since the charger reports no voltage; else the last value;
-  else 230 V. Its `source` attribute names which.
-- **Car connected** binary sensor, from the status code; while locked (status 6) it
-  uses `r_sta.charger_status` = 19 to tell "locked, car" from "locked, no car".
-- **Lock state from `r_sta.lock_status`**, the charger's actual lock, instead of
-  inferring it from status 6. Falls back to status 6 if `r_sta` is unavailable.
-- **Max available current** (`r_sta`).
-- **Auto-lock** switch and delay (`g_alo` / `s_alo`). The charger stores one value,
-  seconds, 0 = off, and answers with a bare number; switching off and on again
-  restores the previous delay.
-- **Halo LED** brightness select (`g_halocfg` / `s_halocfg`). The write needs the whole
-  object, so standby mode and timeout are kept as last read.
-- **Reboot charger** button (`rebot`).
-- **Notifications** count and latest message (`r_not`).
-- Diagnostics: total sessions (`r_ses.last`; `size` is the log capacity, 99999 on the
-  Max), Power Boost limit (`r_hsh`), firmware (`fw_v_`, answered outside `r`), serial
-  number, grounding (shape and "healthy" code differ by family, so integers are shown
-  as codes), and OCPP status (off by default).
-- Settings and slow counters are read every 5 minutes, identity once per connection,
-  and a write re-reads them at once.
-
-### Fixed
-
-- **One lost status reply no longer makes the whole device unavailable.** Through a
-  proxy, a reply occasionally never arrives; every entity used to go unavailable until
-  the next poll succeeded, which could take 30 s when that poll also did the slow
-  settings read. The last values are now kept, and the device only goes unavailable
-  after three status polls in a row go unanswered (or the link stays down that long).
-- **A slow write no longer forces a reconnect.** Through an ESPHome proxy, every
-  20-byte write waits for an ATT write response relayed over Wi-Fi, and the 2 s write
-  timeout was hit routinely. Each hit forced a reconnect, after which the charger
-  stopped advertising for minutes ("last advertisement 266s ago … out of connection
-  slots"). That's the "comes back for a few seconds, then fails" seen in the field.
-  The timeout is now 10 s, which still bounds a genuinely wedged write.
-- **A late reply no longer breaks the requests after it.** When a reply started or
-  stalled past its timeout, the rest of it arrived while the next request was
-  waiting. The parser only resynced after a complete message, and a buffer starting
-  mid-message never completes, so that request failed too, and often the one after
-  it. Incoming text is now split into messages with resync: a message starts at `{"`
-  at the beginning or straight after `}` (a nested object always follows `:`, `,` or
-  `[`), leftovers of earlier replies are dropped, and truncated literals or numbers
-  count as incomplete, not garbage. Request ids are sequential, so a late reply can
-  never match the request now waiting. The first-piece timeout is 8 s (3–7 s seen in
-  the field).
-- **Removed "Lifetime charged energy".** It read `r_sta.grid`, which Pulsar Max
-  6.13.6 does not send. The reference gateway's field is `r_dat.grid`, and it's the
-  session's grid energy, not a lifetime total, which without solar repeats *Session
-  energy*.
-- **Long replies through a Bluetooth proxy are no longer cut off.** The reply timeout
-  was a fixed 2 s for the whole reply. The Pulsar Max keeps a 23-byte ATT MTU, so a
-  status reply arrives as a dozen or more notifications, each relayed over Wi-Fi by
-  the proxy; a field log measured ~1.8 s for a 2-byte reply alone. So every status
-  read timed out and every entity stayed unavailable. This only surfaced once the
-  timeout actually worked: before the cancellation fix below, the bare `except:`
-  swallowed it, and slow replies still got through. Now: up to 5 s for the first
-  piece, then up to 3 s between pieces while the reply keeps arriving, capped at
-  20 s. A silent charger still fails quickly.
-- **The session login (`suser`) is retried.** It ran once per connection, straight
-  after connecting. If that one status read was slow, the login was skipped for the
-  whole session, and the charger needs it before it accepts control commands. The
-  coordinator now completes it on its first successful status read.
-- **One charger request in flight at a time, and no polling until the connection is
-  set up.** A command goes out as several 20-byte writes with awaits in between, and
-  nothing stopped two requests overlapping, so their pieces interleaved on the
-  charger's serial link. Each frame carries its own length, so a mixed stream throws
-  the charger's parser out of step and it stops answering. `ready` was also true as
-  soon as Bluetooth connected, so polling raced the connect sequence's own requests
-  (pairing, login). This was rare with one or two requests per poll; the reads added
-  in this release made the first poll after a connect send about 11, so every
-  connection and every self-heal reload collided with itself and never recovered
-  ("BLE unrecoverable for >180s" every 3 minutes, no data). `request()` now holds a
-  lock across the write and the reply wait, as the reference gateway does
-  (`_cmdMutex`), and `ready` waits for the connect sequence to finish. A test sends
-  four requests at once: on the old code the frames reach the charger corrupted.
-- **An unanswered request no longer hangs polling for good, and Home Assistant can
-  shut down cleanly.** The reply parser wrapped everything in a bare `except:`,
-  which also catches `asyncio.CancelledError`. asyncio delivers a timeout as a
-  cancellation, so the 2 s response timeout was swallowed: a request the charger
-  never answered waited forever, freezing every sensor, and the 180 s self-heal never
-  ran because it lives inside the stuck poll. At shutdown the same swallow produced
-  "Task could not be canceled and was still running after shutdown" for the refresh
-  task. Only incomplete JSON (keep reading) and complete-but-foreign frames (drop
-  them) are handled now. The old code also kept a complete frame without our `id` in
-  the buffer, so no later reply could parse. Reproduced on Python 3.11 and 3.13; the
-  original code had the bug, and the extra reads added in this release made it
-  likelier to trigger.
-- **Reads the charger ignores are dropped after three unanswered polls in a row**, with
-  one warning naming the command. A timeout on an optional read only counts when the
-  status read in the same poll was answered, so a dead link never disables anything.
-  Without this, a read the charger never answers would cost the full 2 s timeout on
-  every poll. The status read itself is never dropped, and the timeout log now names
-  the command that went unanswered.
-- The "cannot pair from Home Assistant (D-Bus)" line is now debug, not a warning. It
-  is expected on every restart of an install without local BlueZ, such as Home
-  Assistant Container. If pairing through the proxy then fails, that is still a
-  warning, with the decoded reason.
-- Removed `connection_established()`. It was never called, and it busy-looped on an
-  un-awaited `asyncio.sleep`, which would have frozen the event loop if anything had.
-- **Status code 19 ("connected, no current") no longer breaks every poll.** The status
-  list stopped at 18 and the lookup indexed it directly, raising `IndexError`; Power
-  Boost holding current back is exactly when 19 appears. Unknown codes now show as
-  `UNKNOWN_<n>` instead of raising.
-- A poll that returns no data no longer raises on `data.get`.
-
-### Tests
-
-- `test_field_link` replays a field log from a Pulsar Max (fw 6.13.6) behind an
-  ESPHome proxy: its real replies, the measured latency, and the faults that log
-  showed (a slow write, a reply starting late, one stalling halfway, one never coming,
-  `g_halocfg` never answered). It asserts that exactly the faulted requests fail, on
-  one connection. On `907f417` it reproduces both field symptoms: a slow write forces
-  a reconnect and the run stalls at 19 requests; and, without slow writes, two
-  unfaulted requests fail behind a late reply. Simulation timers are now the
-  integration's own constants × one scale factor, so their ratios are the real ones.
-  `tests/test_stream.py` covers the message splitter with real fragments, cut at every
-  position.
-- `tests/test_simulation.py`: end-to-end runs of the real connection loop, request
-  path and coordinator against a simulated charger. 72 combinations of Bluetooth path
-  × radio profile × passcode × meter × link speed, plus 9 failure scenarios. The
-  simulated charger validates every frame and stops answering on a corrupt one, as
-  the real one does. Run against the two commits that broke in the field, it
-  reproduces both failures: overlapping requests losing their replies (`093d970`),
-  and a slow proxy never getting healthy (`50d7cd5`). 235 tests in all, on Python
-  3.11 and 3.13; `requirements_test.txt` lists what they need.
+- **Grid and house current and power** from the Power Boost meter (`r_dca`). With the
+  meter's voltage reference wired, grid power is the meter's own active power and its
+  energy counter is exposed as *Grid meter energy*; without it, power is current ×
+  voltage. House = grid − the charger's own power, never below 0.
+- **Supply voltage**: the meter when it has a voltage reference, else the charger's
+  power ÷ current while charging, else the last value, else 230 V. The `source`
+  attribute names which.
+- **Car connected** binary sensor.
+- **Max available current**, **notifications** (count and latest message).
+- **Auto-lock** switch and delay, **Halo LED** brightness select, **Reboot** button.
+- Diagnostics: total sessions, Power Boost limit, firmware, serial number, grounding,
+  OCPP status (off by default).
+- Proxy pairing errors are decoded into the SMP reason and the fix to make.
 
 ### Changed
 
-- BAPI error responses are kept rather than discarded, so "not supported" (error 4)
-  is told apart from a missed answer: only error 4 stops meter polling, and a missed
-  answer keeps the last reading instead of flapping sensors to unavailable.
-- Charging power is the charger's own reported power (`r_dat.cp`) where it reports
-  one, else current × the supply voltage above, rather than current × a fixed 230 V.
+- Lock state comes from the charger's own `r_sta.lock_status`.
+- Charging power is the charger's reported power (`r_dat.cp`) where available.
+- Pairing through a proxy is requested once per connection, and a command write the
+  charger rejects as unauthenticated triggers pairing and is resent.
+- Requests to the charger are sent one at a time, and polling waits until the
+  connection is fully set up (notifications, pairing, login).
+- Reply and write timeouts suit a Bluetooth proxy: up to 8 s for the first piece of a
+  reply, 3 s between pieces, 20 s in all; 10 s per write. Leftovers of a late reply are
+  dropped, and request ids are sequential.
+- Settings and slow counters are read every 5 minutes, identity once per connection;
+  a write re-reads them at once. A read the charger never answers is skipped after
+  three tries.
+- A missed status reply keeps the last values; the device goes unavailable only after
+  three missed polls in a row.
+- The session login is retried on the first successful status read.
+- The "cannot pair from Home Assistant (D-Bus)" message is debug, not a warning;
+  it is expected on Home Assistant Container.
+- README: the proxy YAML uses `auth_req_mode: sc_mitm_bond`, and gains a
+  troubleshooting section.
+
+### Fixed
+
+- Home Assistant shutdown no longer reports "Task could not be canceled", and an
+  unanswered request can no longer hang polling.
+- The BLE client task is stopped when the entry unloads or reloads.
+- Status code 19 ("connected, no current") is recognised; unknown codes show as
+  `UNKNOWN_<n>`.
+- Connect-path warnings are logged once per cause instead of on every retry.
+
+### Tests
+
+- `tests/`: runnable without Home Assistant (`requirements_test.txt`), including an
+  end-to-end simulation of the charger across Bluetooth path, radio profile, passcode,
+  meter and link speed, and a replay of a real proxy link.
 
 ## [0.5.0] - 2026-08-31
 
@@ -178,63 +82,7 @@ automations cover.
   reconnecting forever; changing it drops the stale BlueZ bond first, since BlueZ
   answers `Pair()` for an already-bonded device from its saved keys without
   re-running SMP. Removing the config entry removes the bond too.
-- Pulsar Max row in the README's BLE profile table, and a troubleshooting section
-  for the `Insufficient authentication` write error.
-- `tests/`: pytest suite (47 tests) runnable without Home Assistant installed —
-  `python -m pytest tests`. Covers the BlueZ agent against a faked bus, passcode
-  parsing, error classification, SMP decoding, shutdown, and the proxy pairing
-  race above (which hangs on the code before the fix).
-
-### Fixed
-
-- An `Insufficient authentication` rejection on a command write now triggers
-  pairing and resends the frame, instead of only reconnecting in a loop. This
-  charger accepts the notification CCCD write on an unauthenticated link and
-  only enforces authentication on the command characteristic, so keying the
-  pairing retry off a failing `start_notify` never fired. ATT error 5 also
-  covers a link encrypted with an unauthenticated ("Just Works") key, which is
-  what a Bluetooth proxy left at the default `io_capability` negotiates.
-- A rejected write now logs one actionable error naming the fix — set the
-  passcode, or configure it on the proxy — rather than repeating a raw
-  `BleakError` per chunk per poll.
-- The BLE client task is now cancelled when the config entry unloads. It never
-  was, so every reload — including the coordinator's own 180s self-heal, which
-  fires exactly when a charger is refusing commands — left the previous
-  `run_ble_client()` looping forever. The orphans kept reconnecting, so several
-  clients fought over the charger's single connection slot and each logged its
-  own copy of every failure.
-- Warnings from the connect path are logged once per client instead of once per
-  reconnect attempt, which is every second while a link is failing — keyed by
-  cause, so a changing failure is still reported.
-- Pairing over a Bluetooth proxy now sends one request per connection. The
-  coordinator's poll starts as soon as the link is up, before setup finishes, so
-  a rejected write retried pairing *while the connect path's own request was
-  still in flight*. The proxy answers once per `AUTH_CMPL`, so the overlapping
-  request got no answer and hung for the full 30 s API timeout; then the failed
-  write forced a reconnect, dropping the link under the pending request
-  ("changed connection status while waiting for BluetoothDevicePairingResponse").
-  Pairing is now serialised behind a lock with the result cached per link, a
-  poll that hits a pairing in progress simply fails that poll, and an
-  authentication rejection no longer forces a reconnect — reconnecting cannot
-  authenticate a link. The 60 s health check still reconnects a link that stays
-  unusable, which gives one fresh pairing attempt per minute.
-- README: the proxy YAML recommended `auth_req_mode: bond_mitm`, which clears the
-  Secure Connections bit and downgrades the ESP32 to LE legacy pairing — the
-  opposite of ESP-IDF's own default (`SC_MITM_BOND`, `bta_dm_co.c`) and of the
-  reference gateway's NimBLE `setSecurityAuth(bond, mitm, sc)`. A charger that
-  insists on Secure Connections rejects that with SMP 0x03, indistinguishable from
-  a missing `io_capability`. Now `sc_mitm_bond`, with a `logger.log` line in the
-  passkey automation so the proxy log shows whether the request arrives; the 0x03
-  hint in the integration's log names both causes.
-- A Bluetooth proxy's bare pairing error number is now decoded. ESPHome forwards
-  ESP-IDF's `auth_cmpl.fail_reason`, which Bluedroid offsets by
-  `BTA_DM_AUTH_FAIL_BASE` (`HCI_ERR_MAX_ERR` 0x43 + 10 = 77), so e.g. `error: 80`
-  is SMP 0x03 "authentication requirements" and `error: 102` is SMP 0x19 "timed
-  out". The log now names the code and what to change.
-- The "cannot pair from Home Assistant" warning now says what happens next
-  (falling back to the proxy, which needs the passcode configured on the proxy).
-  Home Assistant Container installs have no system D-Bus at all, so that message
-  is expected there rather than a fault in itself.
+- Pulsar Max row in the README's BLE profile table.
 
 ### Notes
 

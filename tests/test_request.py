@@ -56,7 +56,7 @@ def test_unanswered_request_times_out(monkeypatch):
         client = make_client(monkeypatch, SilentLink())
         return await asyncio.wait_for(client.request("r_sta"), 3)
 
-    # Before the fix this hung until the outer 3 s guard tripped.
+    # Must time out on its own, well inside the outer 3 s guard.
     assert asyncio.run(scenario()) == (False, None)
 
 

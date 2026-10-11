@@ -91,82 +91,33 @@ ble_client:
             passkey: 123456          # your Bluetooth Passcode
 ```
 
-**Keep Secure Connections on.** Use `sc_mitm_bond`, not `bond_mitm`: the latter
-drops the Secure Connections bit (`ESP_LE_AUTH_REQ_SC_ONLY`, `0x08`) and falls back to
-LE legacy pairing, which the charger rejects with SMP 0x03 "authentication
-requirements" — the same error as a missing `io_capability`. `sc_mitm_bond` is also
-ESP-IDF's own default (`bte_appl_cfg` in `bta_dm_co.c`) and matches the reference
-gateway's NimBLE `setSecurityAuth(bond, mitm, sc)`. The `logger.log` line is optional,
-but it shows in the proxy log whether the passkey request ever arrives.
+Keep `auth_req_mode: sc_mitm_bond`: the charger requires Secure Connections, and
+`bond_mitm` drops it. The `logger.log` line is optional; it shows in the proxy log
+that the passkey request arrived.
 
-**`max_connections` is the other part that is easy to get wrong.** The helper `ble_client`
-consumes a connection slot of its own, so with the defaults (`max_connections: 3`,
-three proxy slots) the budget is overrun and ESPHome warns:
+The helper `ble_client` takes a connection slot of its own, hence
+`max_connections: 4` (three proxy slots plus one). Alternatively keep the default and
+give the proxy one slot fewer with `bluetooth_proxy: connection_slots: 2`.
 
-```
-WARNING BLE components require 4 connection slot(s) but only 3 configured.
-        Components: bluetooth_proxy, bluetooth_proxy, bluetooth_proxy, ble_client
-```
-
-Ignore it and the fourth client fails at runtime with `ESP_GATT_NO_RESOURCES`. Raise
-`max_connections` to 4 as above, or keep the default RAM budget by giving the proxy
-one slot fewer with `bluetooth_proxy: connection_slots: 2`.
-
-#### Version notes
-
-Verified against ESPHome 2026.9.0-dev and 2024.3.0 (`esphome config`). 2024.3.0 is
-the floor — it is where `bluetooth_proxy` gained the `PAIRING` feature flag that
-`bluetooth_device_pair` needs. On that vintage `esp32_ble` has no `max_connections`
-or `auth_req_mode` key and there is no slot accounting at all: drop both lines and
-budget by hand with a two-entry `bluetooth_proxy: connections:` list instead. On
-current ESPHome that legacy `connections:` list is still accepted but no longer
-changes the slot count — use `connection_slots:` there.
+Requires ESPHome 2024.3.0 or newer (for `bluetooth_device_pair`). On versions without
+`esp32_ble: max_connections` / `auth_req_mode`, drop those lines and use a two-entry
+`bluetooth_proxy: connections:` list instead.
 
 Chargers without a passcode keep working over a proxy with no extra configuration.
 
 #### Troubleshooting
 
-```
-ERROR ... Failed to write to Bluetooth exc=BleakError('Bluetooth GATT Error
-      address=54:64:DE:92:BC:7C handle=23 error=5 description=Insufficient authentication')
-WARNING ... BLE write did not complete; abandoning and forcing reconnect
-```
+| Log | Fix |
+| --- | --- |
+| `error=5 description=Insufficient authentication` on a write | The link is not authenticated: store the passcode in Home Assistant (*Reconfigure*) and add the YAML above to the proxy |
+| `Pairing … through the Bluetooth proxy failed: SMP … (0x01)` or `(0x04)` | Wrong passcode — check it in the Wallbox app |
+| Same, with `(0x03)` | Proxy is missing `io_capability: keyboard_only` or `auth_req_mode: sc_mitm_bond` |
+| Same, with `(0x09)` | The charger is rate-limiting after failed attempts — wait a few minutes |
+| Same, with `(0x19)` | No `on_passkey_request` answered — check the `ble_client` MAC |
+| `ESP_GATT_NO_RESOURCES` in the proxy log | Connection slots overrun — see `max_connections` above |
 
-That wording (`handle=… error=… description=…`) comes from `aioesphomeapi`, so the
-charger is being reached **through a proxy**, not a local adapter. ATT error 5 means
-the link is not *authenticated* — either nothing paired at all, or it paired "Just
-Works" without the passkey. Note that connecting and enabling notifications both
-succeed regardless; this charger only enforces authentication on the command
-characteristic, so a rejected write is the first sign. Check, in order:
-
-1. **Is a passcode stored in Home Assistant?** *Settings → Devices & Services →
-   Wallbox BLE → Reconfigure*. An entry added before this feature existed has none,
-   and without one the integration never asks the proxy to pair.
-2. **Does the proxy have the YAML above?** Without `io_capability: keyboard_only` the
-   ESP32 advertises NoInputNoOutput and can only negotiate Just Works — which
-   encrypts the link but leaves it unauthenticated, giving exactly this error.
-3. **Is the `ble_client` MAC right, and did the proxy pick up the slot change?**
-   Watch the proxy's log while Home Assistant reconnects; you should see the passkey
-   request arrive. `ESP_GATT_NO_RESOURCES` there means the connection-slot budget is
-   still overrun.
-
-##### Decoding `Pairing failed due to error: N`
-
-A proxy reports the ESP-IDF SMP failure reason as a bare number. Bluedroid offsets
-SMP status codes by `BTA_DM_AUTH_FAIL_BASE`, which is `HCI_ERR_MAX_ERR` (0x43) + 10
-= **77** (`bta_api.h`), so subtract 77 to get the SMP code. The integration does this
-for you and logs the meaning; the common ones are:
-
-| Reported | SMP | Meaning |
-| --- | --- | --- |
-| 78 | 0x01 passkey entry failed | The charger rejected the passcode — check it in the Wallbox app |
-| 80 | 0x03 authentication requirements | The proxy cannot meet the charger's requirements: `io_capability` is still `none`, **or** `auth_req_mode` lacks Secure Connections (`bond_mitm` instead of `sc_mitm_bond`) |
-| 81 | 0x04 confirm value failed | Passcode mismatch |
-| 86 | 0x09 repeated attempts | The charger is rate-limiting after earlier failures — wait a few minutes or power-cycle it |
-| 89 | 0x0C numeric comparison failed | The charger chose numeric comparison — use `on_numeric_comparison_request` with `ble_client.numeric_comparison_reply` |
-| 102 | 0x19 SMP timed out | Pairing started and nothing answered — usually no `on_passkey_request` for this MAC, or the MAC does not match |
-
-Values of 77 or below are plain HCI errors, not SMP codes.
+The proxy reports a bare number (`Pairing failed due to error: 80`); the integration
+decodes it into the SMP reason above and logs what to change.
 
 ## Implemented features
 
@@ -229,8 +180,9 @@ circuits; then *Grid power* is your house figure.
 On a charger without a meter these sensors stay unavailable. The charger answers
 `r_dca` with BAPI error 4, after which the integration stops asking.
 
-For the Energy dashboard, use *Grid meter energy* for grid consumption. For the house alone, run *House power* through Home
-Assistant's **Integral** helper (Riemann sum, method *left*).
+For the Energy dashboard, use *Grid meter energy* for grid consumption. For the house
+alone, run *House power* through Home Assistant's **Integral** helper (Riemann sum,
+method *left*).
 
 ## Requirements
  - Home Assistant with a working Bluetooth integration — either a local adapter
@@ -261,10 +213,5 @@ python -m pytest tests -n auto --timeout=60
 
 No Home Assistant install is needed. `tests/test_simulation.py` runs the real
 connection loop, request path and coordinator against a simulated charger, across
-every combination of Bluetooth path (local adapter / ESPHome proxy), radio profile
-(Pulsar Max / Plus / original Pulsar), passcode, Power Boost meter and link speed,
-plus dropped links, ignored commands, start-up notification failures, a wrong
-passcode, a proxy without the passcode, writes during polling and shutdown. The
-simulated charger checks every frame byte for byte and stops answering on a corrupt
-one, as the real one does.
+Bluetooth path, radio profile, passcode, Power Boost meter and link speed.
 

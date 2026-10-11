@@ -1,8 +1,8 @@
 """End-to-end runs against a simulated charger.
 
-The unit tests check pieces in isolation; the bugs found in the field lived
-between them (the connect sequence racing polling, a fixed reply timeout
-against a slow proxy, a login skipped after one slow read). These tests drive
+The unit tests check pieces in isolation; these cover how they fit together
+(the connect sequence and polling, reply timeouts against a slow proxy, the
+session login). They drive
 the real connection loop (run_ble_client), the real request path and the real
 coordinator against a simulated Wallbox, across every combination of:
 
@@ -667,14 +667,12 @@ def test_shutdown_mid_request_is_clean(monkeypatch):
 def test_field_link(monkeypatch):
     """Replays the link in a field log: a Pulsar Max (fw 6.13.6) behind an
     ESPHome proxy, its real replies, the measured latency, and the faults
-    that log showed -- a write slower than the old 2 s write timeout, a reply
+    that log showed -- a write taking several seconds, a reply
     that starts after the first-piece timeout, one that stalls halfway, one
     that never comes, and g_halocfg never answered.
 
-    Before the fix each slow write forced a reconnect (after which the
-    charger disappeared for minutes), and the stalled reply's tail poisoned
-    the next request too. Now exactly the faulted requests fail, nothing
-    else, on a single connection.
+    Exactly the faulted requests may fail, nothing else, on a single
+    connection, and the device stays available throughout.
     """
     charger = Charger(
         first_delay=scaled(REPLY_START_S), chunk_delay=scaled(REPLY_GAP_S),

@@ -732,11 +732,8 @@ class WallboxBLEApiClient:
     async def get_parsed_response(self, request_id):
         data = ""
         while True:
-            # Deliberately outside the try: CancelledError must propagate. A
-            # bare `except:` here used to swallow it, which (a) defeated the
-            # response timeout -- asyncio delivers a timeout as a cancellation
-            # -- so an unanswered request hung polling for good, and (b) left
-            # Home Assistant unable to cancel the refresh task at shutdown.
+            # No try around the wait: CancelledError must propagate, since
+            # asyncio delivers the response timeout and shutdown as one.
             timeout = RESPONSE_GAP_TIMEOUT_S if data else RESPONSE_START_TIMEOUT_S
             chunk = await asyncio.wait_for(self.rx_queue.get(), timeout)
             # Replies arrive split over several notifications; split_messages
@@ -766,8 +763,8 @@ class WallboxBLEApiClient:
     def ready(self):
         """Connected AND set up (notifications, stream mode, pairing, login).
 
-        The coordinator polls on this. It used to be true as soon as the link
-        connected, so polling raced the setup sequence's own requests.
+        The coordinator polls on this, so polling never races the setup
+        sequence's own requests.
         """
         return self._link_up and self._session_ready
 
