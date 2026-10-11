@@ -350,16 +350,18 @@ class WallboxBLEApiClient:
             # Not on a local BlueZ adapter -- normally an ESPHome Bluetooth
             # proxy. We cannot answer the passkey ourselves there, but the proxy
             # can: see _async_pair_over_link.
+            # Expected wherever Home Assistant has no local BlueZ (e.g. the
+            # Container install has no system D-Bus at all), so not a warning:
+            # if pairing through the proxy then fails, that is logged with
+            # the decoded reason and what to change.
+            if not self._pairing_unsupported_logged:
+                LOGGER.debug(
+                    "Cannot pair with %s from Home Assistant (%s); pairing "
+                    "through the Bluetooth proxy instead",
+                    self.address,
+                    e,
+                )
             self._pairing_unsupported_logged = True
-            self._warn_once(
-                "no_bluez",
-                "Cannot pair with %s from Home Assistant (%s). Falling back to "
-                "pairing through the Bluetooth proxy, which only works if the "
-                "passcode is configured on the proxy itself -- see the "
-                "integration README.",
-                self.address,
-                e,
-            )
             return await self._async_pair_over_link()
         except PairingAuthError as e:
             # A wrong passcode never fixes itself; flag it so the coordinator
@@ -602,9 +604,11 @@ class WallboxBLEApiClient:
         # an authentication rejection apart from a wedged or dead link.
         self._last_write_exc = None
         self._auth_help_logged = False
-        # BAPI error object / whole frame of the most recent response.
+        # BAPI error object / whole frame of the most recent response, and why
+        # the most recent request failed (see request()).
         self.last_error = None
         self.last_response = None
+        self.last_failure = None
         # Keys of warnings already emitted, so a second-by-second reconnect loop
         # reports each distinct problem once.
         self._warned = set()
@@ -737,6 +741,11 @@ class WallboxBLEApiClient:
             )
 
     async def request(self, method, parameter=None):
+        # Why the last request failed: "timeout" when the charger simply did
+        # not answer, None for success or any other failure (link down, write
+        # rejected). Lets the coordinator tell an unsupported read from a
+        # dead link.
+        self.last_failure = None
         if not self.ready:
             LOGGER.debug(f"NOT CONNECTED! {self.client}")
             return False, None
@@ -806,7 +815,8 @@ class WallboxBLEApiClient:
             self.last_success = asyncio.get_running_loop().time()
             return True, response
         except asyncio.TimeoutError:
-            LOGGER.debug("No response!")
+            LOGGER.debug("No response to %s within %ss", method, RESPONSE_TIMEOUT_S)
+            self.last_failure = "timeout"
             return False, None
 
     async def async_get_data(self):
@@ -831,16 +841,6 @@ class WallboxBLEApiClient:
         if not ok:
             return False, None, None, None
         return True, result, self.last_error, self.last_response
-
-    async def async_get_meter(self):
-        """Read the Power Boost / Power Meter accessory (BAPI r_dca).
-
-        Returns (ok, result, error): result is the raw r{} object, and error
-        the BAPI error object when the charger answered with one instead.
-        """
-        self.last_error = None
-        ok, data = await self.request(WallboxBLEApiConst.GET_POWER_BOOST_STATUS)
-        return ok, data, (self.last_error if ok else None)
 
     async def async_get_max_charge_current(self):
         """Get data from the API."""

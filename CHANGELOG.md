@@ -66,6 +66,16 @@ automations cover.
   the buffer, so no later reply could parse. Reproduced on Python 3.11 and 3.13; the
   original code had the bug, and the extra reads added in this release made it
   likelier to trigger.
+- **Reads the charger ignores are dropped after three unanswered polls in a row**, with
+  one warning naming the command. A timeout on an optional read only counts when the
+  status read in the same poll was answered, so a dead link never disables anything.
+  Without this, a read the charger never answers would cost the full 2 s timeout on
+  every poll. The status read itself is never dropped, and the timeout log now names
+  the command that went unanswered.
+- The "cannot pair from Home Assistant (D-Bus)" line is now debug, not a warning. It
+  is expected on every restart of an install without local BlueZ, such as Home
+  Assistant Container. If pairing through the proxy then fails, that is still a
+  warning, with the decoded reason.
 - Removed `connection_established()`. It was never called, and it busy-looped on an
   un-awaited `asyncio.sleep`, which would have frozen the event loop if anything had.
 - **Status code 19 ("connected, no current") no longer breaks every poll.** The status

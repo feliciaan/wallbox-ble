@@ -104,3 +104,28 @@ def test_foreign_frame_does_not_poison_the_next(monkeypatch):
         return await task
 
     assert asyncio.run(scenario()) == (True, 7)
+
+
+def test_timeout_is_reported_as_such(monkeypatch, caplog):
+    async def scenario():
+        client = make_client(monkeypatch, SilentLink())
+        await client.request("r_hsh")
+        return client.last_failure
+
+    caplog.set_level("DEBUG")
+    assert asyncio.run(scenario()) == "timeout"
+    assert any("No response to r_hsh" in r.getMessage() for r in caplog.records)
+
+
+def test_success_clears_the_failure(monkeypatch):
+    async def scenario():
+        link = SilentLink()
+        client = make_client(monkeypatch, link)
+        client.last_failure = "timeout"
+        task = asyncio.create_task(client.request("r_sta"))
+        await asyncio.sleep(0.02)
+        _answer(client, _sent_id(link), r=1)
+        await task
+        return client.last_failure
+
+    assert asyncio.run(scenario()) is None

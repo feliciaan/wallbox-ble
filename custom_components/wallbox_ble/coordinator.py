@@ -27,6 +27,12 @@ SELF_RELOAD_STALE_S = 180
 # traffic over the Bluetooth proxy down. A write refreshes them immediately.
 SLOW_POLL_S = 300
 
+# An optional read the charger leaves unanswered this many polls in a row,
+# while answering the status read in the same poll, is taken as unsupported
+# and not asked for again until the entry reloads. Each unanswered read costs
+# the full response timeout on every poll otherwise.
+MAX_UNANSWERED = 3
+
 
 class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the API."""
@@ -78,6 +84,9 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         self.grounding = None
         self._info_read = False
         self._next_slow_poll = 0.0
+        # Optional reads: consecutive unanswered polls, and those given up on.
+        self._unanswered = {}
+        self._skipped = set()
 
     @classmethod
     async def create(cls, hass, address, pin=None):
@@ -167,9 +176,33 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
             self.voltage, self.voltage_source = voltage, "charger"
         # Otherwise keep the last value and its source.
 
+    async def _read_optional(self, method):
+        """async_read for anything but the core status read.
+
+        Only called after r_dat has answered in the same poll, so a timeout
+        here means the charger ignores this method rather than that the link
+        is down. Other failures (write rejected, link lost) are not counted.
+        """
+        if method in self._skipped:
+            return False, None, None, None
+        ok, result, error, response = await self.wb.async_read(method)
+        if ok:
+            self._unanswered.pop(method, None)
+        elif self.wb.last_failure == "timeout":
+            misses = self._unanswered.get(method, 0) + 1
+            self._unanswered[method] = misses
+            if misses >= MAX_UNANSWERED:
+                self._skipped.add(method)
+                LOGGER.warning(
+                    "Charger did not answer %s %d polls in a row while otherwise "
+                    "responding; no longer asking for it until the integration "
+                    "reloads", method, misses,
+                )
+        return ok, result, error, response
+
     async def _async_update_realtime(self):
         """r_sta: the charger's own lock state and a few live counters."""
-        ok, result, _error, _ = await self.wb.async_read(WallboxBLEApiConst.GET_REALTIME)
+        ok, result, _error, _ = await self._read_optional(WallboxBLEApiConst.GET_REALTIME)
         if ok and isinstance(result, dict):
             self.realtime = result
         # r_sta's lock_status is the charger's actual lock; st == 6 only says
@@ -185,7 +218,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         if not force and now < self._next_slow_poll:
             return
         self._next_slow_poll = now + SLOW_POLL_S
-        read = self.wb.async_read
+        read = self._read_optional
         const = WallboxBLEApiConst
 
         ok, result, _e, _ = await read(const.GET_AUTOLOCK)
@@ -211,7 +244,7 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
 
     async def _async_read_info(self):
         """Firmware, serial and grounding: they do not change while connected."""
-        read = self.wb.async_read
+        read = self._read_optional
         const = WallboxBLEApiConst
         answered = False
         ok, _r, _e, response = await read(const.GET_CHARGER_VERSIONS)
@@ -297,7 +330,9 @@ class WallboxBLEDataUpdateCoordinator(DataUpdateCoordinator):
         """Poll the grid meter, unless the charger has said it has none."""
         if self.meter_supported is False:
             return
-        ok, result, error = await self.wb.async_get_meter()
+        ok, result, error, _ = await self._read_optional(
+            WallboxBLEApiConst.GET_POWER_BOOST_STATUS
+        )
         if not ok:
             # No answer this time; keep the last reading rather than flapping
             # the meter sensors to unavailable on one dropped frame.

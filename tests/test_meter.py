@@ -70,16 +70,23 @@ def test_house_current_subtracts_the_charger_and_never_goes_negative():
 # ---------------------------------------------------------------- poll cycle
 
 class FakeCharger:
-    """Answers BAPI reads from a table; counts what was asked."""
+    """Answers BAPI reads from a table; counts what was asked.
+
+    Methods in `silent` get no answer at all (a timeout); methods missing from
+    `answers` get BAPI error 4, as an unsupported read does.
+    """
 
     ready = True
     pairing_auth_failed = False
 
-    def __init__(self, status, answers=None):
+    def __init__(self, status, answers=None, silent=()):
         self.status = status
         self.answers = answers or {}
+        self.answers.setdefault("r_dca", CURRENT_ONLY)
+        self.silent = set(silent)
         self.reads = []
         self.writes = []
+        self.last_failure = None
 
     async def async_get_max_charge_current(self):
         return True, 32
@@ -87,11 +94,12 @@ class FakeCharger:
     async def async_get_data(self):
         return True, self.status
 
-    async def async_get_meter(self):
-        return True, self.answers.get("r_dca", CURRENT_ONLY), None
-
     async def async_read(self, method):
         self.reads.append(method)
+        self.last_failure = None
+        if method in self.silent:
+            self.last_failure = "timeout"
+            return False, None, None, None
         if method not in self.answers:
             return True, None, {"code": 4}, {"error": {"code": 4}}
         answer = self.answers[method]
@@ -117,9 +125,9 @@ ANSWERS = {
 }
 
 
-def make(status, answers=ANSWERS):
+def make(status, answers=ANSWERS, silent=()):
     c = coordinator_mod.WallboxBLEDataUpdateCoordinator(hass=None)
-    c.wb = FakeCharger(status, dict(answers))
+    c.wb = FakeCharger(status, dict(answers), silent)
     return c
 
 
@@ -211,7 +219,7 @@ def test_slow_poll_cadence():
     assert {"g_alo", "g_halocfg", "r_not", "r_ses", "r_hsh", "fw_v_", "r_sn_", "r_wel"} <= set(first)
     c.wb.reads.clear()
     run_poll(c)
-    assert c.wb.reads == ["r_sta"], "settings re-read on every 10 s poll"
+    assert c.wb.reads == ["r_sta", "r_dca"], "settings re-read on every 10 s poll"
 
 
 def test_identity_retried_until_something_answers():
@@ -286,3 +294,50 @@ def test_meter_energy_only_with_a_voltage_reference():
 
 def test_status_code_list_covers_19():
     assert api.WallboxBLEApiConst.STATUS_CODES[19] == "CONNECTED_NO_CURRENT"
+
+
+# ---------------------------------------------------------------- unanswered reads
+
+def test_unanswered_read_is_dropped_after_three_polls(caplog):
+    c = make({"st": 0, "L1": 0}, silent={"r_sta"})
+    for _ in range(3):
+        run_poll(c)
+    assert "r_sta" in c._skipped
+    assert sum("did not answer r_sta" in r.message for r in caplog.records) == 1
+    c.wb.reads.clear()
+    run_poll(c)
+    assert "r_sta" not in c.wb.reads, "kept asking a read the charger ignores"
+    assert c.available, "an ignored optional read must not take the charger offline"
+
+
+def test_an_answer_resets_the_count():
+    c = make({"st": 0, "L1": 0}, silent={"r_sta"})
+    run_poll(c)
+    run_poll(c)
+    c.wb.silent.clear()
+    run_poll(c)
+    c.wb.silent.add("r_sta")
+    run_poll(c)
+    run_poll(c)
+    assert "r_sta" not in c._skipped  # never three in a row
+
+
+def test_only_timeouts_count():
+    c = make({"st": 0, "L1": 0})
+
+    async def link_lost(method):
+        c.wb.last_failure = None  # e.g. the write failed: not "unanswered"
+        return False, None, None, None
+
+    c.wb.async_read = link_lost
+    for _ in range(5):
+        run_poll(c)
+    assert not c._skipped
+
+
+def test_status_read_is_never_dropped():
+    # r_dat goes through async_get_data, not _read_optional.
+    c = make({"st": 0, "L1": 0}, silent=set(ANSWERS) | {"r_dca"})
+    for _ in range(5):
+        run_poll(c)
+    assert c.available and "r_dat" not in c._skipped
